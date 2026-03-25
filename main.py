@@ -2,207 +2,215 @@ import requests
 import time
 import os
 import random
-import pandas as pd
 
 # =========================
-# 🔧 Telegram 配置
+# 🔧 Telegram
 # =========================
 TG_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
 TG_CHAT_ID = "6308781694"
 
 def send_telegram(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
-        print("⚠️ Telegram未配置", flush=True)
+        print("⚠️ Telegram未配置")
         return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={
-            "chat_id": TG_CHAT_ID,
-            "text": msg
-        }, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={"chat_id": TG_CHAT_ID, "text": msg},
+            timeout=10
+        )
     except Exception as e:
-        print("❌ Telegram发送失败:", e, flush=True)
+        print("❌ TG发送失败:", e)
 
 # =========================
-# 🌐 通用请求（防封）
+# 🌐 Session（防封核心）
 # =========================
-def safe_request(url, headers=None, retry=3):
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Referer": "http://quote.eastmoney.com/",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Connection": "keep-alive"
+})
+
+# =========================
+# 📦 缓存（防崩）
+# =========================
+cache_stocks = []
+cache_changes = set()
+
+# =========================
+# 🛡️ 安全请求
+# =========================
+def safe_get(url, retry=3):
     for i in range(retry):
         try:
-            res = requests.get(url, headers=headers, timeout=10)
+            res = session.get(url, timeout=10)
+
             if "application/json" not in res.headers.get("Content-Type", ""):
-                raise ValueError("非JSON")
+                raise Exception("非JSON")
+
             return res.json()
+
         except Exception as e:
-            print(f"❌ 请求失败，第{i+1}次重试:", e)
-            time.sleep(3 + random.randint(0,3))
+            print(f"❌ 请求失败 {i+1}:", e)
+            time.sleep(random.randint(3, 8))
+
     return None
 
 # =========================
-# SSE数据
-# =========================
-def get_sse_summary():
-    url = "http://www.sse.com.cn/market/stockdata/statistic/"
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "http://www.sse.com.cn/"}
-    data = safe_request(url, headers)
-    print("✅ SSE获取成功" if data else "❌ SSE获取失败")
-    return data
-
-# =========================
-# SZSE数据
-# =========================
-def get_szse_summary():
-    url = "http://www.szse.cn/api/market/overview/index?random=" + str(random.random())
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "http://www.szse.cn/market/overview/index.html"}
-    data = safe_request(url, headers)
-    print("✅ SZSE获取成功" if data else "❌ SZSE获取失败")
-    return data
-
-# =========================
-# 东方财富行情
+# 📊 A股行情（主源）
 # =========================
 def get_all_stocks():
-    url = "http://push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn":1,"pz":2000,"po":1,"np":1,
-        "ut":"bd1d9ddb04089700cf9c27f6f7426281",
-        "fltt":2,"invt":2,"fid":"f3",
-        "fs":"m:0 t:6,m:0 t:13,m:1 t:2,m:1 t:23",
-        "fields":"f12,f14,f2,f3,f5,f6,f7,f8,f9,f10,f62"
-    }
-    headers = {"User-Agent":"Mozilla/5.0","Referer":"http://quote.eastmoney.com/"}
-    data = safe_request(url, headers)
+    global cache_stocks
+
+    url = "http://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=2000&fid=f3&fs=m:0+t:6,m:0+t:13,m:1+t:2"
+
+    data = safe_get(url)
+
     if data:
         stocks = data.get("data", {}).get("diff", [])
-        print(f"📊 获取股票数量: {len(stocks)}")
+        print(f"✅ 行情获取成功: {len(stocks)}")
+        cache_stocks = stocks
         return stocks
-    print("❌ A股API失败")
-    return []
+
+    print("⚠️ 使用缓存行情")
+    return cache_stocks
 
 # =========================
-# 北向资金（示例）
+# 📈 异动（重试+缓存）
+# =========================
+def get_stock_changes():
+    global cache_changes
+
+    url = "http://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+
+    data = safe_get(url)
+
+    if data:
+        klines = data.get("data", {}).get("klines", [])
+        codes = []
+
+        for k in klines:
+            try:
+                code = k.split(",")[0]
+                codes.append(code)
+            except:
+                continue
+
+        print(f"✅ 异动成功: {len(codes)}")
+        cache_changes = set(codes)
+        return cache_changes
+
+    print("⚠️ 使用缓存异动")
+    return cache_changes
+
+# =========================
+# 📊 SSE
+# =========================
+def get_sse():
+    url = "http://www.sse.com.cn/api/market/stockdata/statistic"
+    data = safe_get(url)
+    print("SSE:", "正常" if data else "失败")
+    return data
+
+# =========================
+# 📊 SZSE
+# =========================
+def get_szse():
+    url = "http://www.szse.cn/api/market/overview/index"
+    data = safe_get(url)
+    print("SZSE:", "正常" if data else "失败")
+    return data
+
+# =========================
+# 💰 北向资金（模拟）
 # =========================
 def get_north_money():
-    return 500000000  # 示例流入
+    return random.randint(1, 10) * 100000000
 
 # =========================
-# 东方财富-盘口异动（重试+防封）
+# 🎯 潜力股筛选（重点优化）
 # =========================
-def get_stock_changes(retry=3):
-    url = "http://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "http://quote.eastmoney.com/changes/"}
-    for i in range(retry):
-        try:
-            res = requests.get(url, headers=headers, timeout=10)
-            if "application/json" not in res.headers.get("Content-Type", ""):
-                raise ValueError("非JSON")
-            data = res.json()
-            changes_list = data.get("data", {}).get("klines", [])
-            codes = [x.split(",")[0] for x in changes_list]
-            print(f"📈 异动股票数量: {len(codes)}")
-            return set(codes)
-        except Exception as e:
-            print(f"❌ 异动数据获取失败，第{i+1}次重试:", e)
-            time.sleep(5 + random.randint(0,3))
-    return set()
+def scan(stocks, changes, north_money):
+    result = []
 
-# =========================
-# 潜力股筛选
-# =========================
-def scan_potential_stocks(stocks, north_money=0, changes_set=set()):
-    results = []
     for s in stocks:
         try:
             code = s.get("f12")
             name = s.get("f14")
-            change = float(s.get("f3",0))
-            turnover = float(s.get("f8",0))
-            volume_ratio = float(s.get("f10",0))
-            main_inflow = float(s.get("f62",0))
 
-            if change > 3 or turnover < 3 or main_inflow <=0:
+            change = float(s.get("f3", 0))
+            turnover = float(s.get("f8", 0))
+            volume_ratio = float(s.get("f10", 0))
+            main_inflow = float(s.get("f62", 0))
+
+            # ❗核心：排除涨停股，找“即将启动”
+            if change > 4:
+                continue
+
+            if turnover < 3 or main_inflow <= 0:
                 continue
 
             score = 0
+
             if volume_ratio > 1.5:
                 score += 2
             if turnover > 5:
                 score += 2
             if main_inflow > 5000000:
                 score += 3
-            if north_money > 100000000:
+            if north_money > 200000000:
                 score += 2
-            if code in changes_set:
+            if code in changes:
                 score += 2
 
             if score >= 5:
-                results.append({
-                    "code": code,
-                    "name": name,
-                    "change": change,
-                    "turnover": turnover,
-                    "volume_ratio": volume_ratio,
-                    "main_inflow": main_inflow,
-                    "score": score
-                })
+                result.append((name, code, score, change))
+
         except:
             continue
 
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:10]
+    result.sort(key=lambda x: x[2], reverse=True)
+    return result[:10]
 
 # =========================
-# 市场情绪
-# =========================
-def analyze_market(sse_data, szse_data):
-    msg = "📊 市场状态：正常"
-    if sse_data:
-        msg += " | SSE正常"
-    if szse_data:
-        msg += " | SZSE正常"
-    return msg
-
-# =========================
-# 主循环
+# 🚀 主循环
 # =========================
 def main():
-    print("🚀 潜力股监控系统启动", flush=True)
-    send_telegram("✅ 潜力股监控系统已启动（SSE+SZSE+异动数据）")
+    print("🚀 系统启动")
+    send_telegram("✅ 潜力股系统已启动（稳定版）")
 
     while True:
-        print("🔄 开始扫描...", flush=True)
+        print("\n🔄 开始扫描...")
 
         stocks = get_all_stocks()
-        if not stocks:
-            time.sleep(60)
-            continue
+        changes = get_stock_changes()
 
-        sse_data = get_sse_summary()
-        szse_data = get_szse_summary()
-        sentiment = analyze_market(sse_data, szse_data)
-        print("📈 市场:", sentiment, flush=True)
+        # 多源调用（不会影响主逻辑）
+        get_sse()
+        get_szse()
 
         north_money = get_north_money()
-        changes_set = get_stock_changes()
-        selected = scan_potential_stocks(stocks, north_money=north_money, changes_set=changes_set)
-        print(f"🎯 潜力股筛选结果: {len(selected)}", flush=True)
 
-        for s in selected:
+        picks = scan(stocks, changes, north_money)
+
+        print(f"🎯 选股结果: {len(picks)}")
+
+        for p in picks:
             msg = f"""
-🔥 潜力股
-名称: {s['name']}
-代码: {s['code']}
-涨幅: {s['change']}%
-换手: {s['turnover']}%
-量比: {s['volume_ratio']}
-主力流入: {s['main_inflow']}
-评分: {s['score']}
+🔥潜力股
+{p[0]} ({p[1]})
+评分: {p[2]}
+涨幅: {p[3]}%
 """
+            print(msg)
             send_telegram(msg)
 
-        sleep_time = random.randint(40,80)
-        print(f"⏱ 等待 {sleep_time}s", flush=True)
+        sleep_time = random.randint(40, 80)
+        print(f"⏱ 等待 {sleep_time}s")
         time.sleep(sleep_time)
 
+# =========================
 if __name__ == "__main__":
     main()
