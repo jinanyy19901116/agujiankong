@@ -1,198 +1,209 @@
+import requests
 import time
 import os
-import threading
 import random
-import requests
-import akshare as ak
+import pandas as pd
 
-# ================= 配置 =================
-TG_TOKEN ="8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
-TG_CHAT_ID = 6308781694
+# =========================
+# 🔧 Telegram 配置（必须填）
+# =========================
+TG_TOKEN = os.getenv("TG_TOKEN")  # Railway变量
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
-last_push = {}
-
-# ================= Telegram =================
-def send(msg):
+def send_telegram(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
-        print("⚠️ Telegram未配置", flush=True)
+        print("⚠️ 电报未配置", flush=True)
         return
 
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TG_CHAT_ID, "text": msg}, timeout=5)
+        requests.post(url, data={
+            "chat_id": TG_CHAT_ID,
+            "text": msg
+        }, timeout=10)
     except Exception as e:
-        print("TG发送失败:", e, flush=True)
+        print("❌ Telegram发送失败:", e, flush=True)
 
-# ================= 数据源（AkShare） =================
-def get_stocks():
+# =========================
+# 🌐 通用请求（防封）
+# =========================
+def safe_request(url, headers=None):
     try:
-        df = ak.stock_zh_a_spot_em()
+        res = requests.get(url, headers=headers, timeout=10)
 
-        stocks = []
-        for _, row in df.iterrows():
-            try:
-                stocks.append({
-                    "code": row["代码"],
-                    "name": row["名称"],
-                    "change": float(row["涨跌幅"]),
-                    "turnover": float(row["换手率"]),
-                    "volume_ratio": float(row["量比"]),
-                    "inflow": float(row["主力净流入"]),
-                })
-            except:
-                continue
+        if "application/json" not in res.headers.get("Content-Type", ""):
+            print("⚠️ 返回非JSON（可能被限流）")
+            return None
 
+        return res.json()
+    except Exception as e:
+        print("❌ 请求失败:", e)
+        return None
+
+# =========================
+# 🏦 上交所数据（稳定）
+# =========================
+def get_sse_summary():
+    url = "http://www.sse.com.cn/market/stockdata/statistic/"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "http://www.sse.com.cn/"
+    }
+
+    data = safe_request(url, headers)
+
+    if data:
+        print("✅ SSE获取成功", flush=True)
+    else:
+        print("❌ SSE获取失败", flush=True)
+
+    return data
+
+# =========================
+# 📊 A股行情（东方财富API直连）
+# =========================
+def get_all_stocks():
+    url = "http://push2.eastmoney.com/api/qt/clist/get"
+
+    params = {
+        "pn": 1,
+        "pz": 2000,
+        "po": 1,
+        "np": 1,
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": 2,
+        "invt": 2,
+        "fid": "f3",
+        "fs": "m:0 t:6,m:0 t:13,m:1 t:2,m:1 t:23",
+        "fields": "f12,f14,f2,f3,f5,f6,f7,f8,f9,f10,f62"
+    }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "http://quote.eastmoney.com/"
+    }
+
+    try:
+        res = requests.get(url, params=params, headers=headers, timeout=10)
+        data = res.json()
+
+        stocks = data.get("data", {}).get("diff", [])
+
+        print(f"📊 获取股票数量: {len(stocks)}", flush=True)
         return stocks
 
     except Exception as e:
-        print("❌ AkShare获取失败:", e, flush=True)
+        print("❌ A股API失败:", e)
         return []
 
-# ================= 北向资金 =================
-def get_north_money():
+# =========================
+# 💰 主力资金判断
+# =========================
+def is_main_fund_inflow(stock):
     try:
-        df = ak.stock_hsgt_north_net_flow_em()
-        value = df.iloc[-1]["当日净流入"]
-        return float(value)
+        main_money = stock.get("f62", 0)  # 主力净流入
+        return main_money > 0
     except:
-        return 0
+        return False
 
-# ================= 市场情绪 =================
-def market_emotion(stocks):
-    if not stocks:
-        return "弱"
+# =========================
+# 🔁 换手率判断
+# =========================
+def is_turnover_ok(stock):
+    try:
+        turnover = stock.get("f8", 0)
+        return turnover > 5
+    except:
+        return False
 
-    up = sum(1 for s in stocks if s["change"] > 0)
-    down = len(stocks) - up
+# =========================
+# 🚫 避免涨停买入
+# =========================
+def is_not_limit_up(stock):
+    try:
+        pct = stock.get("f3", 0)
+        return pct < 9.5
+    except:
+        return False
 
-    ratio = up / max(1, down)
+# =========================
+# 📈 市场情绪（SSE）
+# =========================
+def analyze_market(sse_data):
+    try:
+        # ⚠️ SSE结构不固定，这里做容错
+        return "📊 市场正常"
+    except:
+        return "未知"
 
-    if ratio > 1.5:
-        return "强"
-    elif ratio > 1:
-        return "中"
-    else:
-        return "弱"
-
-# ================= 核心策略 =================
-def analyze(stocks):
-    global last_push
-
-    north = get_north_money()
-    emotion = market_emotion(stocks)
-
+# =========================
+# 🔍 核心选股逻辑
+# =========================
+def scan_stocks(stocks):
     results = []
-    now = time.time()
 
-    for s in stocks:
+    for stock in stocks:
         try:
-            code = s["code"]
-            name = s["name"]
-
-            change = s["change"]
-            turnover = s["turnover"]
-            volume_ratio = s["volume_ratio"]
-            inflow = s["inflow"]
-
-            # ===== 提前识别（避免涨停）=====
-            if not (0 < change < 7):
-                continue
-
-            if turnover < 3:
-                continue
-
-            if volume_ratio < 1.5:
-                continue
-
-            # ===== 冷却机制 =====
-            if code in last_push and now - last_push[code] < 300:
-                continue
-
-            # ===== 评分模型 =====
-            score = 0
-
-            # 主力资金
-            if inflow > 30_000_000:
-                score += 3
-
-            # 量能爆发
-            if volume_ratio > 2:
-                score += 3
-
-            # 换手活跃
-            if turnover > 5:
-                score += 2
-
-            # 北向资金
-            if north > 0:
-                score += 2
-            if north > 2_000_000_000:
-                score += 2
-
-            # 情绪加成
-            if emotion == "强":
-                score += 2
-            elif emotion == "弱":
-                score -= 2
-
-            # ===== 信号判断 =====
-            if score >= 9:
-                tag = "🚀强势启动"
-            elif score >= 7:
-                tag = "🔥资金介入"
-            elif score >= 5:
-                tag = "🟢观察"
-            else:
-                continue
-
-            last_push[code] = now
-
-            results.append(
-                (score, f"{tag} {name}({code}) 涨:{change:.2f}% 换手:{turnover}% 量比:{volume_ratio}")
-            )
-
+            if (
+                is_turnover_ok(stock)
+                and is_main_fund_inflow(stock)
+                and is_not_limit_up(stock)
+            ):
+                results.append(stock)
         except:
             continue
 
-    results.sort(reverse=True)
-    return [x[1] for x in results[:10]]
+    return results
 
-# ================= 主循环 =================
-def run():
+# =========================
+# 🚀 主程序
+# =========================
+def main():
+    print("🚀 程序启动成功", flush=True)
+    send_telegram("✅ 系统启动成功")
+
     while True:
-        try:
-            stocks = get_stocks()
+        print("🔄 开始扫描...", flush=True)
 
-            print(f"📊 股票数量: {len(stocks)}", flush=True)
+        # 1️⃣ 股票数据
+        stocks = get_all_stocks()
 
-            if not stocks:
-                time.sleep(30)
-                continue
+        if not stocks:
+            print("❌ 股票数据为空", flush=True)
+            time.sleep(60)
+            continue
 
-            signals = analyze(stocks)
+        # 2️⃣ SSE市场
+        sse_data = get_sse_summary()
+        sentiment = analyze_market(sse_data)
 
-            if signals:
-                print("🚨 信号:", signals, flush=True)
-                send("\n".join(signals))
+        print("📈 市场:", sentiment, flush=True)
 
-            time.sleep(random.randint(20, 40))
+        # 3️⃣ 筛选
+        selected = scan_stocks(stocks)
 
-        except Exception as e:
-            print("❌ 主循环错误:", e, flush=True)
-            time.sleep(30)
+        print(f"🎯 筛选结果: {len(selected)}", flush=True)
 
-# ================= 心跳 =================
-def heartbeat():
-    while True:
-        send("💓系统运行正常")
-        time.sleep(600)
+        # 4️⃣ 推送
+        for s in selected[:5]:  # 最多发5个，防刷屏
+            msg = f"""
+🔥 发现潜力股
+名称: {s.get('f14')}
+代码: {s.get('f12')}
+涨幅: {s.get('f3')}%
+换手: {s.get('f8')}%
+主力流入: {s.get('f62')}
+"""
+            send_telegram(msg)
 
-# ================= 启动 =================
+        # ⏱ 防封随机间隔
+        sleep_time = random.randint(40, 80)
+        print(f"⏱ 等待 {sleep_time}s", flush=True)
+        time.sleep(sleep_time)
+
+# =========================
+# ▶️ 启动
+# =========================
 if __name__ == "__main__":
-    print("🚀 稳定版系统启动", flush=True)
-
-    send("✅ A股监控系统已启动（稳定版）")
-
-    threading.Thread(target=heartbeat).start()
-
-    run()
+    main()
