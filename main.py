@@ -2,24 +2,12 @@ import time
 import os
 import threading
 import random
-
-# 第三方库
-import akshare as ak
-import tushare as ts
 import requests
+import akshare as ak
 
 # ================= 配置 =================
 TG_TOKEN ="8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
 TG_CHAT_ID = 6308781694
-
-TUSHARE_TOKEN = "69c9f84f3ae8dc99b25d0ee2443c218ec28c8c5983859a13c83629dd"
-
-# 初始化 tushare
-if TUSHARE_TOKEN:
-    ts.set_token(TUSHARE_TOKEN)
-    pro = ts.pro_api()
-else:
-    pro = None
 
 last_push = {}
 
@@ -35,49 +23,29 @@ def send(msg):
     except Exception as e:
         print("TG发送失败:", e, flush=True)
 
-# ================= 数据源1：AkShare =================
-def get_stocks_akshare():
+# ================= 数据源（AkShare） =================
+def get_stocks():
     try:
         df = ak.stock_zh_a_spot_em()
 
         stocks = []
         for _, row in df.iterrows():
-            stocks.append({
-                "code": row["代码"],
-                "name": row["名称"],
-                "change": float(row["涨跌幅"]),
-                "turnover": float(row["换手率"]),
-                "volume_ratio": float(row["量比"]),
-                "inflow": float(row["主力净流入"]),
-            })
+            try:
+                stocks.append({
+                    "code": row["代码"],
+                    "name": row["名称"],
+                    "change": float(row["涨跌幅"]),
+                    "turnover": float(row["换手率"]),
+                    "volume_ratio": float(row["量比"]),
+                    "inflow": float(row["主力净流入"]),
+                })
+            except:
+                continue
+
         return stocks
 
     except Exception as e:
-        print("❌ AkShare失败:", e, flush=True)
-        return []
-
-# ================= 数据源2：Tushare =================
-def get_stocks_tushare():
-    if not pro:
-        return []
-
-    try:
-        df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name')
-
-        stocks = []
-        for _, row in df.iterrows():
-            stocks.append({
-                "code": row["ts_code"],
-                "name": row["name"],
-                "change": 0,
-                "turnover": 0,
-                "volume_ratio": 1,
-                "inflow": 0,
-            })
-        return stocks
-
-    except Exception as e:
-        print("❌ Tushare失败:", e, flush=True)
+        print("❌ AkShare获取失败:", e, flush=True)
         return []
 
 # ================= 北向资金 =================
@@ -88,24 +56,6 @@ def get_north_money():
         return float(value)
     except:
         return 0
-
-# ================= 多数据源容灾 =================
-def get_all_stocks():
-    stocks = get_stocks_akshare()
-
-    if stocks:
-        print("✅ 使用 AkShare 数据", flush=True)
-        return stocks
-
-    print("⚠️ AkShare失败，切换Tushare", flush=True)
-
-    stocks = get_stocks_tushare()
-
-    if stocks:
-        return stocks
-
-    print("❌ 所有数据源失败", flush=True)
-    return []
 
 # ================= 市场情绪 =================
 def market_emotion(stocks):
@@ -144,7 +94,7 @@ def analyze(stocks):
             volume_ratio = s["volume_ratio"]
             inflow = s["inflow"]
 
-            # ===== 提前识别（未涨停）=====
+            # ===== 提前识别（避免涨停）=====
             if not (0 < change < 7):
                 continue
 
@@ -154,7 +104,7 @@ def analyze(stocks):
             if volume_ratio < 1.5:
                 continue
 
-            # ===== 冷却 =====
+            # ===== 冷却机制 =====
             if code in last_push and now - last_push[code] < 300:
                 continue
 
@@ -165,29 +115,33 @@ def analyze(stocks):
             if inflow > 30_000_000:
                 score += 3
 
-            # 量能
+            # 量能爆发
             if volume_ratio > 2:
                 score += 3
 
-            # 换手
+            # 换手活跃
             if turnover > 5:
                 score += 2
 
-            # 北向
+            # 北向资金
             if north > 0:
                 score += 2
+            if north > 2_000_000_000:
+                score += 2
 
-            # 情绪
+            # 情绪加成
             if emotion == "强":
                 score += 2
             elif emotion == "弱":
                 score -= 2
 
-            # ===== 信号 =====
-            if score >= 8:
-                tag = "🚀强势"
-            elif score >= 6:
-                tag = "🔥启动"
+            # ===== 信号判断 =====
+            if score >= 9:
+                tag = "🚀强势启动"
+            elif score >= 7:
+                tag = "🔥资金介入"
+            elif score >= 5:
+                tag = "🟢观察"
             else:
                 continue
 
@@ -197,7 +151,7 @@ def analyze(stocks):
                 (score, f"{tag} {name}({code}) 涨:{change:.2f}% 换手:{turnover}% 量比:{volume_ratio}")
             )
 
-        except Exception:
+        except:
             continue
 
     results.sort(reverse=True)
@@ -207,7 +161,7 @@ def analyze(stocks):
 def run():
     while True:
         try:
-            stocks = get_all_stocks()
+            stocks = get_stocks()
 
             print(f"📊 股票数量: {len(stocks)}", flush=True)
 
@@ -235,9 +189,9 @@ def heartbeat():
 
 # ================= 启动 =================
 if __name__ == "__main__":
-    print("🚀 多数据源监控系统启动", flush=True)
+    print("🚀 稳定版系统启动", flush=True)
 
-    send("✅ 系统启动成功（AkShare + Tushare）")
+    send("✅ A股监控系统已启动（稳定版）")
 
     threading.Thread(target=heartbeat).start()
 
