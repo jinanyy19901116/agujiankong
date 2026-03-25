@@ -2,152 +2,189 @@ import requests
 import time
 import os
 import yfinance as yf
+import datetime
 
 # ================= 配置 =================
-# ================= 配置 =================
-TELEGRAM_BOT_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
-TELEGRAM_CHAT_ID = 6308781694
+TG_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
+TG_CHAT_ID = 6308781694
 
 A_STOCK_API = "https://push2.eastmoney.com/api/qt/clist/get"
-BINANCE_API = "https://api.binance.com/api/v3/ticker/price"
 
-# ================= 工具 =================
+# 热门板块（可根据热点更新）
+HOT_SECTORS = ["科技", "半导体", "AI", "软件", "消费", "新能源", "石油", "有色"]
 
+# ================= Telegram =================
 def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
-    except:
-        pass
+        requests.post(url, data={"chat_id": TG_CHAT_ID, "text": msg}, timeout=10)
+    except Exception as e:
+        print("Telegram发送失败:", e, flush=True)
 
+# ================= A股全市场 =================
+def get_all_stocks():
+    all_stocks = []
+    page = 1
 
-def get_a_stock_data():
-    params = {
-        "pn": 1,
-        "pz": 300,
-        "fs": "m:0+t:6,m:1+t:2",
-        "fields": "f12,f14,f3,f8,f62,f6,f5"  # 成交量也加入
-    }
-    try:
-        res = requests.get(A_STOCK_API, params=params, timeout=10).json()
-        return res.get("data", {}).get("diff", [])
-    except:
-        return []
+    while True:
+        params = {
+            "pn": page,
+            "pz": 200,
+            "fs": "m:0+t:6,m:1+t:2",
+            "fields": "f12,f14,f3,f8,f62,f6,f5,f10,f21"  # f10:量比 f21:板块
+        }
 
-
-def get_btc():
-    try:
-        res = requests.get(BINANCE_API, timeout=10).json()
-        btc = [x for x in res if x['symbol'] == 'BTCUSDT'][0]
-        return float(btc['price'])
-    except:
-        return None
-
-
-def get_nq():
-    try:
-        ticker = yf.Ticker("NQ=F")
-        data = ticker.history(period="1d", interval="1m")
-        return data['Close'].iloc[-1]
-    except:
-        return None
-
-
-# ================= 核心策略（提前发现上涨） =================
-
-def filter_stocks(stocks, btc_now, btc_prev, nq_now, nq_prev):
-    result = []
-
-    btc_up = btc_now and btc_prev and btc_now > btc_prev
-    nq_up = nq_now and nq_prev and nq_now > nq_prev
-
-    for s in stocks:
         try:
-            name = s.get("f14")
-            code = s.get("f12")
+            res = requests.get(A_STOCK_API, params=params, timeout=10).json()
+            data = res.get("data", {}).get("diff", [])
 
-            turnover = float(s.get("f8", 0))
-            main_inflow = float(s.get("f62", 0))
-            amount = float(s.get("f6", 0))
-            change = float(s.get("f3", 0))
-            volume = float(s.get("f5", 0))
+            if not data:
+                break
 
-            # ===== 提前启动信号（核心升级） =====
-            early_signal = (
-                turnover > 3 and  # 不用等5%，提前发现
-                main_inflow > 10_000_000 and  # 提高资金门槛
-                amount > 300_000_000 and
-                0 < change < 5  # 严格限制涨幅（防止追高）
-            )
+            all_stocks.extend(data)
+            page += 1
 
-            # ===== 强势确认信号 =====
-            strong_signal = (
-                turnover > 5 and
-                main_inflow > 50_000_000 and
-                amount > 800_000_000 and
-                0 < change < 7
-            )
+        except Exception as e:
+            print("获取股票失败:", e, flush=True)
+            break
 
-            if not (early_signal or strong_signal):
-                continue
+    return all_stocks
 
-            tag = ""
+# ================= 全球期货 =================
+def get_futures():
+    symbols = {
+        "nasdaq": "NQ=F",
+        "sp500": "ES=F",
+        "dow": "YM=F",
+        "oil": "CL=F",
+        "gold": "GC=F",
+        "silver": "SI=F",
+        "copper": "HG=F",
+        "gas": "NG=F"
+    }
 
-            if early_signal:
-                tag += "【启动】"
-            if strong_signal:
-                tag += "【强化】"
+    data = {}
 
-            if nq_up:
-                tag += "【纳指↑】"
-            if btc_up:
-                tag += "【情绪↑】"
-
-            result.append(
-                f"{tag}{name}({code}) 涨幅:{change}% 换手:{turnover}% 成交:{round(amount/1e8,2)}亿 主力:{round(main_inflow/1e8,2)}亿"
-            )
-
+    for k, v in symbols.items():
+        try:
+            price = yf.Ticker(v).history(period="1d", interval="1m")['Close'].iloc[-1]
+            data[k] = price
         except:
             continue
 
+    return data
+
+# ================= 期货趋势 =================
+def futures_trend(now, prev):
+    trend = {}
+    for k in now:
+        if k in prev:
+            trend[k] = now[k] > prev[k]
+    return trend
+
+# ================= 核心策略 =================
+def filter_stocks(stocks, futures_signal, last_inflow):
+    result = []
+
+    for s in stocks:
+        try:
+            name = s["f14"]
+            code = s["f12"]
+            turnover = float(s["f8"])
+            inflow = float(s["f62"])
+            amount = float(s["f6"])
+            change = float(s["f3"])
+            volume_ratio = float(s.get("f10", 0))
+            sector = s.get("f21", "")
+
+            # ---------------- 条件1：板块过滤 ----------------
+            if sector not in HOT_SECTORS:
+                continue
+
+            # ---------------- 条件2：低位启动 ----------------
+            if not (0 < change < 5):
+                continue
+
+            # ---------------- 条件3：分时资金加速 ----------------
+            delta_inflow = inflow - last_inflow.get(code, 0)
+            last_inflow[code] = inflow
+
+            if delta_inflow < 5_000_000:
+                continue
+
+            # ---------------- 条件4：换手率 + 量比 ----------------
+            if turnover < 3 or volume_ratio < 1.5:
+                continue
+
+            # ---------------- 标签 ----------------
+            tag = "【启动】"
+            if delta_inflow > 20_000_000 and volume_ratio > 2:
+                tag = "🔥强信号"
+
+            # 期货联动
+            for f in futures_signal:
+                if futures_signal[f]:
+                    tag += f"【{f}↑】"
+
+            result.append(
+                f"{tag}{name}({code}) 涨幅:{change:.2f}% 换手:{turnover:.2f}% 成交:{round(amount/1e8,2)}亿 板块:{sector}"
+            )
+
+        except Exception as e:
+            continue
+
+    # ---------------- 龙头筛选 ----------------
+    # 资金前20% or 涨幅前20%
+    result = sorted(result, key=lambda x: float(x.split("涨幅:")[1].split("%")[0]), reverse=True)
+    result = result[:20]
+
     return result
 
-
 # ================= 主程序 =================
-
 def main():
-    btc_prev = None
-    nq_prev = None
+    futures_prev = {}
+    last_inflow = {}
 
     while True:
         try:
-            stocks = get_a_stock_data()
-            btc_now = get_btc()
-            nq_now = get_nq()
+            # ---------------- 时间过滤 ----------------
+            hour = datetime.datetime.now().hour
+            if hour >= 14:
+                print("14点后不执行监控", flush=True)
+                time.sleep(300)
+                continue
 
-            picks = filter_stocks(stocks, btc_now, btc_prev, nq_now, nq_prev)
+            print("开始扫描...", flush=True)
+            stocks = get_all_stocks()
+            print(f"股票数量: {len(stocks)}", flush=True)
+
+            futures_now = get_futures()
+            print(f"期货数据: {futures_now}", flush=True)
+
+            futures_signal = futures_trend(futures_now, futures_prev)
+
+            picks = filter_stocks(stocks, futures_signal, last_inflow)
 
             if picks:
+                print("发现信号:", flush=True)
                 send_telegram("\n".join(picks))
 
-            btc_prev = btc_now
-            nq_prev = nq_now
-
-            print("扫描完成")
+            futures_prev = futures_now
+            print("扫描完成", flush=True)
             time.sleep(60)
 
         except Exception as e:
-            print("错误:", e)
+            print("错误:", e, flush=True)
             time.sleep(60)
 
-
+# ================= Telegram测试 =================
 def telegram_test():
     msg = "✅ Telegram连接测试成功！系统已启动"
     send_telegram(msg)
     print("已发送Telegram测试消息", flush=True)
 
-
+# ================= 启动 =================
 if __name__ == "__main__":
     print("程序启动成功", flush=True)
-    telegram_test()  # 启动时先测试Telegram
+    telegram_test()
     main()
