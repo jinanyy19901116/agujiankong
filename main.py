@@ -5,8 +5,8 @@ import yfinance as yf
 
 # ================= 配置 =================
 # ================= 配置 =================
-TG_TOKEN = AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM
-TG_CHAT_ID = 6308781694
+TELEGRAM_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
+TELEGRAM_CHAT_ID = 6308781694
 
 A_STOCK_API = "https://push2.eastmoney.com/api/qt/clist/get"
 BINANCE_API = "https://api.binance.com/api/v3/ticker/price"
