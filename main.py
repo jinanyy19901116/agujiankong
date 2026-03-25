@@ -1,10 +1,13 @@
-import requests
-import time
 import os
+import time
 import random
+import pandas as pd
+import akshare as ak
+import tushare as ts
+import requests
 
 # =========================
-# 🔧 Telegram
+# 🔧 Telegram 配置
 # =========================
 TG_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
 TG_CHAT_ID = "6308781694"
@@ -20,132 +23,93 @@ def send_telegram(msg):
             timeout=10
         )
     except Exception as e:
-        print("❌ TG发送失败:", e)
+        print("❌ Telegram发送失败:", e)
 
 # =========================
-# 🌐 Session（防封核心）
+# 💹 Tushare 初始化
 # =========================
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Referer": "http://quote.eastmoney.com/",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Connection": "keep-alive"
-})
+TS_TOKEN = os.getenv("TS_TOKEN")  # 你的tushare token
+ts.set_token(TS_TOKEN)
+pro = ts.pro_api()
 
 # =========================
-# 📦 缓存（防崩）
+# 📦 缓存机制
 # =========================
-cache_stocks = []
-cache_changes = set()
+cache_stocks = pd.DataFrame()
+cache_changes = pd.DataFrame()
 
 # =========================
-# 🛡️ 安全请求
+# 🛡️ 安全获取数据
 # =========================
-def safe_get(url, retry=3):
+def safe_akshare(func, *args, retry=3, **kwargs):
+    global cache_stocks, cache_changes
     for i in range(retry):
         try:
-            res = session.get(url, timeout=10)
-
-            if "application/json" not in res.headers.get("Content-Type", ""):
-                raise Exception("非JSON")
-
-            return res.json()
-
+            df = func(*args, **kwargs)
+            if df is None or df.empty:
+                raise ValueError("空数据")
+            return df
         except Exception as e:
-            print(f"❌ 请求失败 {i+1}:", e)
-            time.sleep(random.randint(3, 8))
-
-    return None
+            print(f"❌ 数据获取失败 第{i+1}次:", e)
+            time.sleep(random.randint(3,7))
+    # 返回缓存
+    print("⚠️ 使用缓存数据")
+    if func == ak.stock_em_yingbi:
+        return cache_changes
+    else:
+        return cache_stocks
 
 # =========================
-# 📊 A股行情（主源）
+# 📊 获取沪深A股行情
 # =========================
 def get_all_stocks():
     global cache_stocks
-
-    url = "http://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=2000&fid=f3&fs=m:0+t:6,m:0+t:13,m:1+t:2"
-
-    data = safe_get(url)
-
-    if data:
-        stocks = data.get("data", {}).get("diff", [])
-        print(f"✅ 行情获取成功: {len(stocks)}")
-        cache_stocks = stocks
-        return stocks
-
-    print("⚠️ 使用缓存行情")
-    return cache_stocks
+    try:
+        sh = safe_akshare(ak.stock_zh_a_spot_em, symbol="sh")
+        sz = safe_akshare(ak.stock_zh_a_spot_em, symbol="sz")
+        all_stocks = pd.concat([sh, sz], ignore_index=True)
+        cache_stocks = all_stocks
+        return all_stocks
+    except:
+        return cache_stocks
 
 # =========================
-# 📈 异动（重试+缓存）
+# 📈 获取异动数据
 # =========================
 def get_stock_changes():
     global cache_changes
-
-    url = "http://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
-
-    data = safe_get(url)
-
-    if data:
-        klines = data.get("data", {}).get("klines", [])
-        codes = []
-
-        for k in klines:
-            try:
-                code = k.split(",")[0]
-                codes.append(code)
-            except:
-                continue
-
-        print(f"✅ 异动成功: {len(codes)}")
-        cache_changes = set(codes)
-        return cache_changes
-
-    print("⚠️ 使用缓存异动")
-    return cache_changes
+    df = safe_akshare(ak.stock_em_yingbi)
+    cache_changes = df
+    return df
 
 # =========================
-# 📊 SSE
-# =========================
-def get_sse():
-    url = "http://www.sse.com.cn/api/market/stockdata/statistic"
-    data = safe_get(url)
-    print("SSE:", "正常" if data else "失败")
-    return data
-
-# =========================
-# 📊 SZSE
-# =========================
-def get_szse():
-    url = "http://www.szse.cn/api/market/overview/index"
-    data = safe_get(url)
-    print("SZSE:", "正常" if data else "失败")
-    return data
-
-# =========================
-# 💰 北向资金（模拟）
+# 💰 北向资金示例
 # =========================
 def get_north_money():
-    return random.randint(1, 10) * 100000000
+    try:
+        df = pro.moneyflow_hsgt_daily(ts_code='', start_date='20260101', end_date='20260325')
+        total = df['net_mf_amt'].sum()
+        return total
+    except:
+        return 0
 
 # =========================
-# 🎯 潜力股筛选（重点优化）
+# 🎯 潜力股筛选
 # =========================
-def scan(stocks, changes, north_money):
-    result = []
+def scan_potential_stocks(all_stocks, changes_df, north_money):
+    results = []
+    changes_codes = set(changes_df['code']) if not changes_df.empty else set()
 
-    for s in stocks:
+    for _, row in all_stocks.iterrows():
         try:
-            code = s.get("f12")
-            name = s.get("f14")
+            code = row['代码'] if '代码' in row else row['symbol']
+            name = row['名称'] if '名称' in row else row['name']
+            change = float(row.get('涨跌幅', row.get('changepercent',0)))
+            turnover = float(row.get('换手率', row.get('turnoverratio',0)))
+            volume_ratio = float(row.get('量比', row.get('amount',0)))
+            main_inflow = float(row.get('主力净流入', 0))
 
-            change = float(s.get("f3", 0))
-            turnover = float(s.get("f8", 0))
-            volume_ratio = float(s.get("f10", 0))
-            main_inflow = float(s.get("f62", 0))
-
-            # ❗核心：排除涨停股，找“即将启动”
+            # ❗ 排除已经涨停或大幅上涨
             if change > 4:
                 continue
 
@@ -153,7 +117,6 @@ def scan(stocks, changes, north_money):
                 continue
 
             score = 0
-
             if volume_ratio > 1.5:
                 score += 2
             if turnover > 5:
@@ -162,55 +125,57 @@ def scan(stocks, changes, north_money):
                 score += 3
             if north_money > 200000000:
                 score += 2
-            if code in changes:
+            if code in changes_codes:
                 score += 2
 
             if score >= 5:
-                result.append((name, code, score, change))
-
+                results.append({
+                    "code": code,
+                    "name": name,
+                    "change": change,
+                    "turnover": turnover,
+                    "volume_ratio": volume_ratio,
+                    "main_inflow": main_inflow,
+                    "score": score
+                })
         except:
             continue
 
-    result.sort(key=lambda x: x[2], reverse=True)
-    return result[:10]
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:10]
 
 # =========================
 # 🚀 主循环
 # =========================
 def main():
-    print("🚀 系统启动")
-    send_telegram("✅ 潜力股系统已启动（稳定版）")
+    print("🚀 潜力股系统启动")
+    send_telegram("✅ 潜力股系统已启动（AkShare+Tushare稳定版）")
 
     while True:
-        print("\n🔄 开始扫描...")
-
-        stocks = get_all_stocks()
-        changes = get_stock_changes()
-
-        # 多源调用（不会影响主逻辑）
-        get_sse()
-        get_szse()
-
+        print("\n🔄 扫描中...")
+        all_stocks = get_all_stocks()
+        changes_df = get_stock_changes()
         north_money = get_north_money()
 
-        picks = scan(stocks, changes, north_money)
+        selected = scan_potential_stocks(all_stocks, changes_df, north_money)
+        print(f"🎯 潜力股数量: {len(selected)}")
 
-        print(f"🎯 选股结果: {len(picks)}")
-
-        for p in picks:
+        for s in selected:
             msg = f"""
-🔥潜力股
-{p[0]} ({p[1]})
-评分: {p[2]}
-涨幅: {p[3]}%
+🔥 潜力股
+{name}({code})
+涨幅: {s['change']}%
+换手率: {s['turnover']}%
+量比: {s['volume_ratio']}
+主力净流入: {s['main_inflow']}
+评分: {s['score']}
 """
             print(msg)
             send_telegram(msg)
 
-        sleep_time = random.randint(40, 80)
+        sleep_time = random.randint(40,80)
         print(f"⏱ 等待 {sleep_time}s")
         time.sleep(sleep_time)
 
-# =========================
 if __name__ == "__main__":
     main()
