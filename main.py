@@ -7,8 +7,8 @@ import pandas as pd
 # =========================
 # 🔧 Telegram 配置（必须填）
 # =========================
-TG_TOKEN = os.getenv("TG_TOKEN")  # Railway变量
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+TG_TOKEN =  "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
+TG_CHAT_ID ="6308781694"
 
 def send_telegram(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
