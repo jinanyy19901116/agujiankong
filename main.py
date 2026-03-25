@@ -26,16 +26,17 @@ def send_telegram(msg):
 # =========================
 # 🌐 通用请求（防封）
 # =========================
-def safe_request(url, headers=None):
-    try:
-        res = requests.get(url, headers=headers, timeout=10)
-        if "application/json" not in res.headers.get("Content-Type", ""):
-            print("⚠️ 返回非JSON（可能被限流）")
-            return None
-        return res.json()
-    except Exception as e:
-        print("❌ 请求失败:", e)
-        return None
+def safe_request(url, headers=None, retry=3):
+    for i in range(retry):
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if "application/json" not in res.headers.get("Content-Type", ""):
+                raise ValueError("非JSON")
+            return res.json()
+        except Exception as e:
+            print(f"❌ 请求失败，第{i+1}次重试:", e)
+            time.sleep(3 + random.randint(0,3))
+    return None
 
 # =========================
 # SSE数据
@@ -70,39 +71,40 @@ def get_all_stocks():
         "fields":"f12,f14,f2,f3,f5,f6,f7,f8,f9,f10,f62"
     }
     headers = {"User-Agent":"Mozilla/5.0","Referer":"http://quote.eastmoney.com/"}
-    try:
-        res = requests.get(url, params=params, headers=headers, timeout=10)
-        data = res.json()
+    data = safe_request(url, headers)
+    if data:
         stocks = data.get("data", {}).get("diff", [])
         print(f"📊 获取股票数量: {len(stocks)}")
         return stocks
-    except Exception as e:
-        print("❌ A股API失败:", e)
-        return []
+    print("❌ A股API失败")
+    return []
 
 # =========================
 # 北向资金（示例）
 # =========================
 def get_north_money():
-    # 可替换为真实北向资金接口
-    return 500000000
+    return 500000000  # 示例流入
 
 # =========================
-# 东方财富-盘口异动
+# 东方财富-盘口异动（重试+防封）
 # =========================
-def get_stock_changes():
+def get_stock_changes(retry=3):
     url = "http://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
-    # 简化示例，可换成正式“changes”接口
-    try:
-        res = requests.get(url, timeout=10)
-        data = res.json()
-        changes_list = data.get("data", {}).get("klines", [])
-        codes = [x.split(",")[0] for x in changes_list]  # 提取代码
-        print(f"📈 异动股票数量: {len(codes)}")
-        return set(codes)
-    except:
-        print("❌ 异动数据获取失败")
-        return set()
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "http://quote.eastmoney.com/changes/"}
+    for i in range(retry):
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if "application/json" not in res.headers.get("Content-Type", ""):
+                raise ValueError("非JSON")
+            data = res.json()
+            changes_list = data.get("data", {}).get("klines", [])
+            codes = [x.split(",")[0] for x in changes_list]
+            print(f"📈 异动股票数量: {len(codes)}")
+            return set(codes)
+        except Exception as e:
+            print(f"❌ 异动数据获取失败，第{i+1}次重试:", e)
+            time.sleep(5 + random.randint(0,3))
+    return set()
 
 # =========================
 # 潜力股筛选
@@ -130,7 +132,7 @@ def scan_potential_stocks(stocks, north_money=0, changes_set=set()):
                 score += 3
             if north_money > 100000000:
                 score += 2
-            if code in changes_set:  # 异动加分
+            if code in changes_set:
                 score += 2
 
             if score >= 5:
@@ -168,7 +170,7 @@ def main():
     send_telegram("✅ 潜力股监控系统已启动（SSE+SZSE+异动数据）")
 
     while True:
-        print("🔄 开始扫描...")
+        print("🔄 开始扫描...", flush=True)
 
         stocks = get_all_stocks()
         if not stocks:
@@ -183,7 +185,7 @@ def main():
         north_money = get_north_money()
         changes_set = get_stock_changes()
         selected = scan_potential_stocks(stocks, north_money=north_money, changes_set=changes_set)
-        print(f"🎯 潜力股筛选结果: {len(selected)}")
+        print(f"🎯 潜力股筛选结果: {len(selected)}", flush=True)
 
         for s in selected:
             msg = f"""
@@ -199,7 +201,7 @@ def main():
             send_telegram(msg)
 
         sleep_time = random.randint(40,80)
-        print(f"⏱ 等待 {sleep_time}s")
+        print(f"⏱ 等待 {sleep_time}s", flush=True)
         time.sleep(sleep_time)
 
 if __name__ == "__main__":
