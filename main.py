@@ -4,8 +4,9 @@ import os
 import yfinance as yf
 
 # ================= 配置 =================
-TELEGRAM_BOT_TOKEN = os.getenv("TG_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
+# ================= 配置 =================
+TG_TOKEN = AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM
+TG_CHAT_ID = 6308781694
 
 A_STOCK_API = "https://push2.eastmoney.com/api/qt/clist/get"
 BINANCE_API = "https://api.binance.com/api/v3/ticker/price"
