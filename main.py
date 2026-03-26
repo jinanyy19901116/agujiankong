@@ -21,6 +21,7 @@ from websockets.exceptions import InvalidStatus
 
 REST_BASE = os.getenv("REST_BASE", "https://data-api.binance.vision").rstrip("/")
 WS_BASE = os.getenv("WS_BASE", "wss://data-stream.binance.vision/stream?streams=").strip()
+FUTURES_REST_BASE = os.getenv("FUTURES_REST_BASE", "https://fapi.binance.com").rstrip("/")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PORT = int(os.getenv("PORT", "8080"))
@@ -73,7 +74,7 @@ WEAK_BUY_MOMENTUM_THRESHOLD = float(os.getenv("WEAK_BUY_MOMENTUM_THRESHOLD", "1.
 SELL_MOMENTUM_THRESHOLD = float(os.getenv("SELL_MOMENTUM_THRESHOLD", "-3.0"))
 BUY_MAX_SPREAD_PCT = float(os.getenv("BUY_MAX_SPREAD_PCT", "0.5"))
 
-# 大单监控
+# 大单 / 订单流
 LARGE_TRADE_MIN_NOTIONAL = float(os.getenv("LARGE_TRADE_MIN_NOTIONAL", "50000"))
 LARGE_TRADE_CLUSTER_WINDOW_SEC = float(os.getenv("LARGE_TRADE_CLUSTER_WINDOW_SEC", "2.0"))
 LARGE_TRADE_CLUSTER_MIN_NOTIONAL = float(os.getenv("LARGE_TRADE_CLUSTER_MIN_NOTIONAL", "150000"))
@@ -82,6 +83,13 @@ LARGE_TRADE_MAX_MICRO_NOTIONAL = float(os.getenv("LARGE_TRADE_MAX_MICRO_NOTIONAL
 LARGE_TRADE_MIN_SIDE_DOMINANCE = float(os.getenv("LARGE_TRADE_MIN_SIDE_DOMINANCE", "0.7"))
 LARGE_TRADE_MIN_CLUSTER_COUNT = int(os.getenv("LARGE_TRADE_MIN_CLUSTER_COUNT", "2"))
 ORDER_FLOW_WINDOW_SEC = int(os.getenv("ORDER_FLOW_WINDOW_SEC", "12"))
+
+# 确认机制
+CONFIRMATION_DELAY_SEC = float(os.getenv("CONFIRMATION_DELAY_SEC", "5"))
+CONFIRMATION_PRICE_MOVE_PCT = float(os.getenv("CONFIRMATION_PRICE_MOVE_PCT", "0.25"))
+CVD_IMBALANCE_THRESHOLD = float(os.getenv("CVD_IMBALANCE_THRESHOLD", "0.65"))
+BREAKOUT_LOOKBACK_SEC = int(os.getenv("BREAKOUT_LOOKBACK_SEC", "60"))
+BREAKOUT_BUFFER_PCT = float(os.getenv("BREAKOUT_BUFFER_PCT", "0.10"))
 
 # 机器人噪音过滤
 BOT_MAX_ALTERNATING_TRADES = int(os.getenv("BOT_MAX_ALTERNATING_TRADES", "8"))
@@ -102,7 +110,7 @@ class MiniTickerState:
     base_volume_24h: float = 0.0
     quote_volume_24h: float = 0.0
     last_update_ts: float = 0.0
-    recent_prices: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=900))
+    recent_prices: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=1200))
     hot_score: float = 0.0
     is_hot: bool = False
 
@@ -120,7 +128,23 @@ class AggTradeEvent:
     price: float
     qty: float
     notional: float
-    side: str  # "buy" 表示主动买盘, "sell" 表示主动卖盘
+    side: str  # "buy" / "sell"
+
+
+@dataclass
+class PendingFlowSignal:
+    symbol: str
+    side: str
+    created_at: float
+    start_price: float
+    end_price: float
+    dominant_notional: float
+    total_notional: float
+    side_ratio: float
+    trade_count: int
+    max_trade_notional: float
+    imbalance_ratio: float
+    breakout_ok: bool
 
 
 @dataclass
@@ -183,14 +207,17 @@ class TelegramNotifier:
 # =========================================================
 
 class BinanceUniverse:
-    def __init__(self, rest_base: str):
+    def __init__(self, rest_base: str, futures_rest_base: str):
         self.rest_base = rest_base
+        self.futures_rest_base = futures_rest_base
         self.session: Optional[aiohttp.ClientSession] = None
         self.allowed_symbols: Set[str] = set()
+        self.futures_symbols: Set[str] = set()
+        self.spot_symbols: Set[str] = set()
 
     async def start(self) -> None:
         if self.session is None:
-            timeout = aiohttp.ClientTimeout(total=15)
+            timeout = aiohttp.ClientTimeout(total=20)
             self.session = aiohttp.ClientSession(timeout=timeout)
 
     async def close(self) -> None:
@@ -198,7 +225,7 @@ class BinanceUniverse:
             await self.session.close()
             self.session = None
 
-    async def refresh(self) -> None:
+    async def _fetch_spot_symbols(self) -> Set[str]:
         if self.session is None:
             await self.start()
 
@@ -208,6 +235,7 @@ class BinanceUniverse:
             data = await resp.json()
 
         allowed: Set[str] = set()
+
         for item in data.get("symbols", []):
             symbol = item.get("symbol", "").upper()
             status = item.get("status", "")
@@ -228,8 +256,52 @@ class BinanceUniverse:
 
             allowed.add(symbol)
 
-        self.allowed_symbols = allowed
-        logging.info("交易池刷新完成: %s 个山寨币", len(self.allowed_symbols))
+        return allowed
+
+    async def _fetch_usdm_futures_symbols(self) -> Set[str]:
+        if self.session is None:
+            await self.start()
+
+        url = f"{self.futures_rest_base}/fapi/v1/exchangeInfo"
+        async with self.session.get(url) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+        futures_symbols: Set[str] = set()
+
+        for item in data.get("symbols", []):
+            symbol = item.get("symbol", "").upper()
+            status = item.get("status", "")
+            quote_asset = item.get("quoteAsset", "").upper()
+
+            if status != "TRADING":
+                continue
+            if quote_asset != QUOTE_ASSET:
+                continue
+
+            futures_symbols.add(symbol)
+
+        return futures_symbols
+
+    async def refresh(self) -> None:
+        if self.session is None:
+            await self.start()
+
+        spot_symbols, futures_symbols = await asyncio.gather(
+            self._fetch_spot_symbols(),
+            self._fetch_usdm_futures_symbols(),
+        )
+
+        self.spot_symbols = spot_symbols
+        self.futures_symbols = futures_symbols
+        self.allowed_symbols = spot_symbols & futures_symbols
+
+        logging.info(
+            "交易池刷新完成: 现货山寨币=%s, 合约币种=%s, 最终可监控=%s",
+            len(spot_symbols),
+            len(futures_symbols),
+            len(self.allowed_symbols),
+        )
 
 
 # =========================================================
@@ -239,16 +311,17 @@ class BinanceUniverse:
 class AltcoinScanner:
     def __init__(self):
         self.runtime = RuntimeStatus()
-        self.universe = BinanceUniverse(REST_BASE)
+        self.universe = BinanceUniverse(REST_BASE, FUTURES_REST_BASE)
         self.notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
         self.market: Dict[str, MiniTickerState] = {}
         self.book: Dict[str, BookTickerState] = defaultdict(BookTickerState)
-        self.trade_flow: Dict[str, Deque[AggTradeEvent]] = defaultdict(lambda: deque(maxlen=2000))
+        self.trade_flow: Dict[str, Deque[AggTradeEvent]] = defaultdict(lambda: deque(maxlen=3000))
 
         self.hot_symbols: Set[str] = set()
         self.last_alert_at: Dict[str, float] = defaultdict(float)
-        self.last_large_flow_alert_ts: Dict[str, float] = defaultdict(float)
+        self.pending_confirmations: Dict[str, PendingFlowSignal] = {}
+        self.confirmation_tasks: Dict[str, asyncio.Task] = {}
 
         self.ws = None
         self._stop_event = asyncio.Event()
@@ -258,10 +331,6 @@ class AltcoinScanner:
 
     def stop(self) -> None:
         self._stop_event.set()
-
-    # -------------------------
-    # 工具函数
-    # -------------------------
 
     @staticmethod
     def _pct_change(start_price: float, end_price: float) -> float:
@@ -289,11 +358,49 @@ class AltcoinScanner:
         ask = self.book[symbol].ask
         if not bid or not ask or bid <= 0 or ask <= 0:
             return 0.0
-
         mid = (bid + ask) / 2.0
         if mid <= 0:
             return 0.0
         return (ask - bid) / mid * 100.0
+
+    def _get_breakout_info(self, symbol: str) -> Tuple[bool, str]:
+        state = self.market.get(symbol)
+        if not state or len(state.recent_prices) < 3:
+            return False, "缺少突破参考数据"
+
+        now = time.time()
+        cutoff = now - BREAKOUT_LOOKBACK_SEC
+        prices = [p for ts, p in state.recent_prices if ts >= cutoff]
+        if len(prices) < 3:
+            return False, "近1分钟价格样本不足"
+
+        current = prices[-1]
+        prev_high = max(prices[:-1])
+        prev_low = min(prices[:-1])
+
+        up_break = current >= prev_high * (1 + BREAKOUT_BUFFER_PCT / 100.0)
+        down_break = current <= prev_low * (1 - BREAKOUT_BUFFER_PCT / 100.0)
+
+        if up_break:
+            return True, f"突破近{BREAKOUT_LOOKBACK_SEC}秒高点"
+        if down_break:
+            return True, f"跌破近{BREAKOUT_LOOKBACK_SEC}秒低点"
+        return False, "未形成有效突破"
+
+    def _order_flow_imbalance(self, symbol: str) -> float:
+        now = time.time()
+        flow = self.trade_flow[symbol]
+        cutoff = now - ORDER_FLOW_WINDOW_SEC
+        while flow and flow[0].ts < cutoff:
+            flow.popleft()
+
+        buy_notional = sum(e.notional for e in flow if e.side == "buy")
+        sell_notional = sum(e.notional for e in flow if e.side == "sell")
+        total = buy_notional + sell_notional
+        if total <= 0:
+            return 0.0
+
+        return (buy_notional - sell_notional) / total
 
     def _score_symbol(self, state: MiniTickerState, now: float) -> float:
         if state.open_24h <= 0 or state.last_price <= 0:
@@ -345,24 +452,26 @@ class AltcoinScanner:
         momentum = self._recent_momentum_pct(state, time.time())
         pct_24h = self._pct_change(state.open_24h, state.last_price)
         spread_pct = self._get_spread_pct(symbol)
+        imbalance = self._order_flow_imbalance(symbol)
 
-        if state.hot_score >= BUY_SCORE_THRESHOLD and momentum >= BUY_MOMENTUM_THRESHOLD and spread_pct <= BUY_MAX_SPREAD_PCT:
+        if (
+            state.hot_score >= BUY_SCORE_THRESHOLD
+            and momentum >= BUY_MOMENTUM_THRESHOLD
+            and spread_pct <= BUY_MAX_SPREAD_PCT
+            and imbalance >= CVD_IMBALANCE_THRESHOLD
+        ):
             return "买入", (
-                f"热度较高（{state.hot_score}），"
-                f"短线动量强（{momentum:.2f}%），"
-                f"价差正常（{spread_pct:.3f}%）"
+                f"热度高（{state.hot_score}），短线动量强（{momentum:.2f}%），"
+                f"主动买盘占优（{imbalance:.2f}），价差正常（{spread_pct:.3f}%）"
             )
 
-        if momentum <= SELL_MOMENTUM_THRESHOLD:
-            return "卖出", f"短线动量转弱（{momentum:.2f}%）"
+        if momentum <= SELL_MOMENTUM_THRESHOLD and imbalance <= -CVD_IMBALANCE_THRESHOLD:
+            return "卖出", f"短线动量转弱（{momentum:.2f}%），主动卖盘占优（{imbalance:.2f}）"
 
         if state.hot_score >= WEAK_BUY_SCORE_THRESHOLD and momentum >= WEAK_BUY_MOMENTUM_THRESHOLD and pct_24h > 0:
-            return "买入", (
-                f"热度偏强（{state.hot_score}），"
-                f"短线继续上行（{momentum:.2f}%）"
-            )
+            return "买入", f"热度偏强（{state.hot_score}），短线继续上行（{momentum:.2f}%）"
 
-        return "观望", f"当前信号不够一致：热度={state.hot_score}，短线动量={momentum:.2f}%"
+        return "观望", f"当前信号不够一致：热度={state.hot_score}，动量={momentum:.2f}%，失衡={imbalance:.2f}"
 
     def _recent_flow_window(self, symbol: str, now: float) -> List[AggTradeEvent]:
         flow = self.trade_flow[symbol]
@@ -379,13 +488,11 @@ class AltcoinScanner:
         if len(recent) < BOT_MAX_ALTERNATING_TRADES:
             return False
 
-        sides = [e.side for e in recent[-BOT_MAX_ALTERNATING_TRADES:]]
-        alternating = 0
-        for i in range(1, len(sides)):
-            if sides[i] != sides[i - 1]:
-                alternating += 1
+        last_n = recent[-BOT_MAX_ALTERNATING_TRADES:]
+        sides = [e.side for e in last_n]
+        alternating = sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1])
+        time_span = last_n[-1].ts - last_n[0].ts
 
-        time_span = recent[-1].ts - recent[max(0, len(recent) - BOT_MAX_ALTERNATING_TRADES)].ts
         return alternating >= BOT_MAX_ALTERNATING_TRADES - 1 and time_span <= BOT_MICRO_BURST_WINDOW_SEC
 
     def _detect_large_order_flow(self, symbol: str) -> Optional[dict]:
@@ -399,11 +506,9 @@ class AltcoinScanner:
 
         cluster_cutoff = now - LARGE_TRADE_CLUSTER_WINDOW_SEC
         cluster = [e for e in events if e.ts >= cluster_cutoff]
-
         if len(cluster) < LARGE_TRADE_MIN_CLUSTER_COUNT:
             return None
 
-        # 过滤微小成交，聚焦真正有冲击的大单
         cluster = [e for e in cluster if e.notional >= LARGE_TRADE_MAX_MICRO_NOTIONAL]
         if len(cluster) < LARGE_TRADE_MIN_CLUSTER_COUNT:
             return None
@@ -411,18 +516,15 @@ class AltcoinScanner:
         buy_notional = sum(e.notional for e in cluster if e.side == "buy")
         sell_notional = sum(e.notional for e in cluster if e.side == "sell")
         total_notional = buy_notional + sell_notional
-
         if total_notional < LARGE_TRADE_CLUSTER_MIN_NOTIONAL:
             return None
 
         dominant_side = "buy" if buy_notional >= sell_notional else "sell"
         dominant_notional = max(buy_notional, sell_notional)
         side_ratio = dominant_notional / total_notional if total_notional > 0 else 0.0
-
         if side_ratio < LARGE_TRADE_MIN_SIDE_DOMINANCE:
             return None
 
-        # 至少包含一笔真正的大单
         max_trade_notional = max(e.notional for e in cluster)
         if max_trade_notional < LARGE_TRADE_MIN_NOTIONAL:
             return None
@@ -436,6 +538,16 @@ class AltcoinScanner:
         if dominant_side == "sell" and price_move_pct > -LARGE_TRADE_FOLLOWTHROUGH_PCT:
             return None
 
+        imbalance = self._order_flow_imbalance(symbol)
+        if dominant_side == "buy" and imbalance < CVD_IMBALANCE_THRESHOLD:
+            return None
+        if dominant_side == "sell" and imbalance > -CVD_IMBALANCE_THRESHOLD:
+            return None
+
+        breakout_ok, breakout_reason = self._get_breakout_info(symbol)
+        if not breakout_ok:
+            return None
+
         return {
             "side": dominant_side,
             "total_notional": total_notional,
@@ -446,11 +558,9 @@ class AltcoinScanner:
             "max_trade_notional": max_trade_notional,
             "start_price": start_price,
             "end_price": end_price,
+            "imbalance_ratio": imbalance,
+            "breakout_reason": breakout_reason,
         }
-
-    # -------------------------
-    # 提醒
-    # -------------------------
 
     async def _maybe_alert(self, key: str, text: str) -> None:
         now = time.time()
@@ -501,35 +611,57 @@ class AltcoinScanner:
             f"操作建议：{signal_text}\n"
             f"原因：{signal_reason}\n\n"
             f"{MOMENTUM_WINDOW_SEC // 60}分钟涨跌幅：{momentum:.2f}%\n"
+            f"订单流失衡：{self._order_flow_imbalance(symbol):.2f}\n"
             f"热度分数：{state.hot_score}\n"
             f"最新价格：{state.last_price}"
         )
         await self._maybe_alert(f"mom:{symbol}", msg)
 
-    async def _alert_large_order_flow(self, symbol: str, result: dict) -> None:
-        side = result["side"]
-        signal = "买入" if side == "buy" else "卖出"
-        direction = "上涨" if side == "buy" else "下跌"
+    async def _alert_large_order_flow_confirmed(self, signal: PendingFlowSignal, confirmed_move_pct: float) -> None:
+        signal_text = "买入" if signal.side == "buy" else "卖出"
+        direction = "上涨" if signal.side == "buy" else "下跌"
 
         msg = (
-            f"【大单推动预警】\n"
-            f"币种：{symbol}\n"
-            f"操作建议：{signal}\n"
-            f"原因：检测到主导性大单簇推动价格{direction}\n\n"
-            f"主导方向：{'主动买盘' if side == 'buy' else '主动卖盘'}\n"
-            f"聚合成交额：{result['total_notional']:,.0f} {QUOTE_ASSET}\n"
-            f"主导成交额占比：{result['side_ratio'] * 100:.1f}%\n"
-            f"最大单笔成交额：{result['max_trade_notional']:,.0f} {QUOTE_ASSET}\n"
-            f"成交笔数：{result['trade_count']}\n"
-            f"价格变化：{result['price_move_pct']:.2f}%\n"
-            f"起始价格：{result['start_price']}\n"
-            f"当前价格：{result['end_price']}"
+            f"【大单推动确认预警】\n"
+            f"币种：{signal.symbol}\n"
+            f"操作建议：{signal_text}\n"
+            f"原因：大单簇出现后价格继续{direction}\n\n"
+            f"主导方向：{'主动买盘' if signal.side == 'buy' else '主动卖盘'}\n"
+            f"聚合成交额：{signal.total_notional:,.0f} {QUOTE_ASSET}\n"
+            f"主导成交额占比：{signal.side_ratio * 100:.1f}%\n"
+            f"最大单笔成交额：{signal.max_trade_notional:,.0f} {QUOTE_ASSET}\n"
+            f"成交笔数：{signal.trade_count}\n"
+            f"订单流失衡：{signal.imbalance_ratio:.2f}\n"
+            f"突破状态：{'是' if signal.breakout_ok else '否'}\n"
+            f"初始推动价格：{signal.start_price} -> {signal.end_price}\n"
+            f"{CONFIRMATION_DELAY_SEC:.0f}秒后延续幅度：{confirmed_move_pct:.2f}%"
         )
-        await self._maybe_alert(f"flow:{symbol}:{side}", msg)
+        await self._maybe_alert(f"flow_confirmed:{signal.symbol}:{signal.side}", msg)
 
-    # -------------------------
-    # 健康检查
-    # -------------------------
+    async def _schedule_confirmation(self, signal: PendingFlowSignal) -> None:
+        key = f"{signal.symbol}:{signal.side}"
+        old_task = self.confirmation_tasks.get(key)
+        if old_task and not old_task.done():
+            old_task.cancel()
+
+        async def _confirm() -> None:
+            try:
+                await asyncio.sleep(CONFIRMATION_DELAY_SEC)
+                state = self.market.get(signal.symbol)
+                if not state or state.last_price <= 0:
+                    return
+
+                current_price = state.last_price
+                move_pct = self._pct_change(signal.end_price, current_price)
+
+                if signal.side == "buy" and move_pct >= CONFIRMATION_PRICE_MOVE_PCT:
+                    await self._alert_large_order_flow_confirmed(signal, move_pct)
+                elif signal.side == "sell" and move_pct <= -CONFIRMATION_PRICE_MOVE_PCT:
+                    await self._alert_large_order_flow_confirmed(signal, move_pct)
+            except asyncio.CancelledError:
+                return
+
+        self.confirmation_tasks[key] = asyncio.create_task(_confirm())
 
     async def _health(self, request: web.Request) -> web.Response:
         now = time.time()
@@ -541,6 +673,8 @@ class AltcoinScanner:
             "last_message_at": self.runtime.last_message_at,
             "reconnect_count": self.runtime.reconnect_count,
             "universe_size": self.runtime.universe_size,
+            "futures_symbol_count": len(self.universe.futures_symbols),
+            "spot_symbol_count": len(self.universe.spot_symbols),
             "hot_pool_size": self.runtime.hot_pool_size,
             "last_error": self.runtime.last_error,
             "hot_symbols": sorted(list(self.hot_symbols))[:50],
@@ -561,10 +695,6 @@ class AltcoinScanner:
         site = web.TCPSite(self.health_runner, "0.0.0.0", PORT)
         await site.start()
         logging.info("健康检查服务已启动: 0.0.0.0:%s", PORT)
-
-    # -------------------------
-    # WS 控制
-    # -------------------------
 
     async def _subscribe_streams(self, params: List[str]) -> None:
         if not params or self.ws is None:
@@ -594,10 +724,6 @@ class AltcoinScanner:
                 logging.info("WebSocket 订阅操作成功，id=%s", payload.get("id"))
             else:
                 logging.info("WebSocket 控制响应: %s", payload)
-
-    # -------------------------
-    # 消息处理
-    # -------------------------
 
     async def _handle_mini_ticker_arr(self, arr: list) -> None:
         now = time.time()
@@ -671,7 +797,7 @@ class AltcoinScanner:
         price = float(data.get("p", 0.0))
         qty = float(data.get("q", 0.0))
         ts = float(data.get("T", 0)) / 1000.0
-        # m=true 表示买方是挂单方 => 主动卖盘; m=false => 主动买盘
+
         is_buyer_maker = bool(data.get("m", False))
         side = "sell" if is_buyer_maker else "buy"
         notional = price * qty
@@ -687,7 +813,22 @@ class AltcoinScanner:
 
         result = self._detect_large_order_flow(symbol)
         if result:
-            await self._alert_large_order_flow(symbol, result)
+            pending = PendingFlowSignal(
+                symbol=symbol,
+                side=result["side"],
+                created_at=time.time(),
+                start_price=result["start_price"],
+                end_price=result["end_price"],
+                dominant_notional=result["dominant_notional"],
+                total_notional=result["total_notional"],
+                side_ratio=result["side_ratio"],
+                trade_count=result["trade_count"],
+                max_trade_notional=result["max_trade_notional"],
+                imbalance_ratio=result["imbalance_ratio"],
+                breakout_ok=True,
+            )
+            self.pending_confirmations[f"{symbol}:{result['side']}"] = pending
+            await self._schedule_confirmation(pending)
 
     async def _handle_message(self, raw: str) -> None:
         self.runtime.last_message_at = time.time()
@@ -712,10 +853,6 @@ class AltcoinScanner:
             await self._handle_agg_trade(data)
             return
 
-    # -------------------------
-    # 定时刷新
-    # -------------------------
-
     async def _periodic_universe_refresh(self) -> None:
         now = time.time()
         if now - self._last_universe_refresh < UNIVERSE_REFRESH_SEC:
@@ -735,10 +872,6 @@ class AltcoinScanner:
             self.hot_symbols -= invalid_hot
             self.runtime.hot_pool_size = len(self.hot_symbols)
 
-    # -------------------------
-    # 启动 / 关闭
-    # -------------------------
-
     async def start(self) -> None:
         await self.universe.start()
         await self.universe.refresh()
@@ -752,7 +885,8 @@ class AltcoinScanner:
         await self.notifier.send(
             "【系统启动成功】\n"
             "山寨币全市场扫描已启动\n"
-            "重点监控：大单推动上涨 / 下跌\n"
+            "仅监控：有 USDⓈ-M 合约的币种\n"
+            "重点监控：大单推动 + 订单流失衡 + 延续确认\n"
             "已启用：机器人噪音过滤"
         )
 
@@ -760,16 +894,17 @@ class AltcoinScanner:
 
     async def close(self) -> None:
         self.runtime.connected = False
+
+        for task in self.confirmation_tasks.values():
+            if not task.done():
+                task.cancel()
+
         await self.universe.close()
         await self.notifier.close()
 
         if self.health_runner is not None:
             await self.health_runner.cleanup()
             self.health_runner = None
-
-    # -------------------------
-    # 主循环
-    # -------------------------
 
     async def _run(self) -> None:
         ws_url = WS_BASE + DISCOVERY_STREAM
