@@ -36,7 +36,6 @@ DISCOVERY_STREAM = "!miniTicker@arr"
 UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC", "1800"))
 TOP_N_SUBSCRIBE = int(os.getenv("TOP_N_SUBSCRIBE", "80"))
 MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "1000000"))
-
 ALLOW_SPOT_FALLBACK = os.getenv("ALLOW_SPOT_FALLBACK", "true").lower() == "true"
 
 EXCLUDED_BASE_ASSETS: Set[str] = {
@@ -78,17 +77,19 @@ UPBIT_HOT_SYMBOLS: Set[str] = {
 
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "180"))
 
-AGGRESSIVE_LARGE_NOTIONAL = float(os.getenv("AGGRESSIVE_LARGE_NOTIONAL", "80000"))
-AGGRESSIVE_CLUSTER_WINDOW_SEC = float(os.getenv("AGGRESSIVE_CLUSTER_WINDOW_SEC", "2.0"))
-AGGRESSIVE_CLUSTER_MIN_NOTIONAL = float(os.getenv("AGGRESSIVE_CLUSTER_MIN_NOTIONAL", "180000"))
-AGGRESSIVE_MIN_SIDE_DOMINANCE = float(os.getenv("AGGRESSIVE_MIN_SIDE_DOMINANCE", "0.75"))
-AGGRESSIVE_MIN_TRADE_COUNT = int(os.getenv("AGGRESSIVE_MIN_TRADE_COUNT", "2"))
+# ==================== 趋势确认 ====================
+TREND_CONFIRM_WINDOW_SEC = float(os.getenv("TREND_CONFIRM_WINDOW_SEC", "4.0"))
+TREND_CONFIRM_MIN_NOTIONAL = float(os.getenv("TREND_CONFIRM_MIN_NOTIONAL", "220000"))
+TREND_CONFIRM_MIN_DOMINANCE = float(os.getenv("TREND_CONFIRM_MIN_DOMINANCE", "0.72"))
+TREND_CONFIRM_MIN_MOVE_PCT = float(os.getenv("TREND_CONFIRM_MIN_MOVE_PCT", "0.18"))
+TREND_CONFIRM_MIN_IMBALANCE = float(os.getenv("TREND_CONFIRM_MIN_IMBALANCE", "0.12"))
+TREND_CONFIRM_MIN_TRADE_COUNT = int(os.getenv("TREND_CONFIRM_MIN_TRADE_COUNT", "3"))
 
-ABSORPTION_WINDOW_SEC = float(os.getenv("ABSORPTION_WINDOW_SEC", "3.0"))
-ABSORPTION_MIN_NOTIONAL = float(os.getenv("ABSORPTION_MIN_NOTIONAL", "150000"))
-ABSORPTION_MAX_PRICE_MOVE_PCT = float(os.getenv("ABSORPTION_MAX_PRICE_MOVE_PCT", "0.12"))
-ABSORPTION_MIN_BOOK_UPDATES = int(os.getenv("ABSORPTION_MIN_BOOK_UPDATES", "3"))
+# ==================== 盘口 ====================
+IMBALANCE_WINDOW_SEC = float(os.getenv("IMBALANCE_WINDOW_SEC", "2.0"))
+MIN_BOOK_SNAPSHOT_FOR_IMBALANCE = int(os.getenv("MIN_BOOK_SNAPSHOT_FOR_IMBALANCE", "3"))
 
+# ==================== 噪音过滤 ====================
 BOT_MAX_MICRO_NOTIONAL = float(os.getenv("BOT_MAX_MICRO_NOTIONAL", "3000"))
 BOT_ALTERNATING_COUNT = int(os.getenv("BOT_ALTERNATING_COUNT", "8"))
 BOT_BURST_WINDOW_SEC = float(os.getenv("BOT_BURST_WINDOW_SEC", "2.0"))
@@ -113,6 +114,12 @@ class BookTickerSnapshot:
     ask: float
     bid_qty: float
     ask_qty: float
+
+    @property
+    def mid(self) -> float:
+        if self.bid > 0 and self.ask > 0:
+            return (self.bid + self.ask) / 2.0
+        return max(self.bid, self.ask, 0.0)
 
 
 @dataclass
@@ -242,12 +249,7 @@ class BinanceUniverse:
         raw = os.getenv("FUTURES_SYMBOLS", "").strip()
         if not raw:
             return set()
-
-        return {
-            s.strip().upper()
-            for s in raw.split(",")
-            if s.strip()
-        }
+        return {s.strip().upper() for s in raw.split(",") if s.strip()}
 
     async def _fetch_usdm_futures_symbols(self) -> Set[str]:
         if self.session is None:
@@ -261,14 +263,11 @@ class BinanceUniverse:
                 if resp.status == 451:
                     if env_symbols:
                         self.futures_source = "env"
-                        logging.warning(
-                            "期货API返回451，已改用环境变量 FUTURES_SYMBOLS，共 %s 个币种",
-                            len(env_symbols),
-                        )
+                        logging.info("期货API返回451，已改用 FUTURES_SYMBOLS，共 %s 个币种", len(env_symbols))
                         return env_symbols
 
                     self.futures_source = "missing_env"
-                    logging.warning("期货API返回451，且未设置FUTURES_SYMBOLS。")
+                    logging.info("期货API返回451，未设置FUTURES_SYMBOLS，当前可切到 spot_fallback。")
                     return set()
 
                 resp.raise_for_status()
@@ -278,14 +277,11 @@ class BinanceUniverse:
             if e.status == 451:
                 if env_symbols:
                     self.futures_source = "env"
-                    logging.warning(
-                        "期货API返回451，已改用环境变量 FUTURES_SYMBOLS，共 %s 个币种",
-                        len(env_symbols),
-                    )
+                    logging.info("期货API返回451，已改用 FUTURES_SYMBOLS，共 %s 个币种", len(env_symbols))
                     return env_symbols
 
                 self.futures_source = "missing_env"
-                logging.warning("期货API返回451，且未设置FUTURES_SYMBOLS。")
+                logging.info("期货API返回451，未设置FUTURES_SYMBOLS，当前可切到 spot_fallback。")
                 return set()
 
             self.futures_source = "error"
@@ -366,7 +362,7 @@ class OrderFlowScanner:
 
         self.market: Dict[str, MiniTickerState] = {}
         self.trade_flow: Dict[str, Deque[AggTradeEvent]] = defaultdict(lambda: deque(maxlen=4000))
-        self.book_flow: Dict[str, Deque[BookTickerSnapshot]] = defaultdict(lambda: deque(maxlen=400))
+        self.book_flow: Dict[str, Deque[BookTickerSnapshot]] = defaultdict(lambda: deque(maxlen=500))
 
         self.active_symbols: Set[str] = set()
         self.last_alert_at: Dict[str, float] = defaultdict(float)
@@ -421,133 +417,99 @@ class OrderFlowScanner:
             return 0.0
         return (b - a) / a * 100.0
 
-    def _detect_aggressive_flow(self, symbol: str) -> Optional[dict]:
-        events = self._get_trade_window(symbol, AGGRESSIVE_CLUSTER_WINDOW_SEC)
-        if len(events) < AGGRESSIVE_MIN_TRADE_COUNT:
-            return None
+    def _book_imbalance(self, symbol: str, sec: float = IMBALANCE_WINDOW_SEC) -> float:
+        books = self._get_book_window(symbol, sec)
+        if len(books) < MIN_BOOK_SNAPSHOT_FOR_IMBALANCE:
+            return 0.0
 
+        vals: List[float] = []
+        for b in books:
+            denom = b.bid_qty + b.ask_qty
+            if denom <= 0:
+                continue
+            vals.append((b.bid_qty - b.ask_qty) / denom)
+
+        if not vals:
+            return 0.0
+        return sum(vals) / len(vals)
+
+    def _detect_trend_confirmation(self, symbol: str) -> Optional[dict]:
+        events = self._get_trade_window(symbol, TREND_CONFIRM_WINDOW_SEC)
+        books = self._get_book_window(symbol, TREND_CONFIRM_WINDOW_SEC)
+
+        if len(events) < TREND_CONFIRM_MIN_TRADE_COUNT:
+            return None
+        if len(books) < MIN_BOOK_SNAPSHOT_FOR_IMBALANCE:
+            return None
         if self._is_bot_noise(events):
             return None
 
         buy_notional = sum(e.notional for e in events if e.side == "buy")
         sell_notional = sum(e.notional for e in events if e.side == "sell")
         total_notional = buy_notional + sell_notional
-        if total_notional < AGGRESSIVE_CLUSTER_MIN_NOTIONAL:
+        if total_notional < TREND_CONFIRM_MIN_NOTIONAL:
             return None
 
-        dominant_side = "buy" if buy_notional >= sell_notional else "sell"
-        dominant_notional = max(buy_notional, sell_notional)
-        side_ratio = dominant_notional / total_notional if total_notional > 0 else 0.0
-        if side_ratio < AGGRESSIVE_MIN_SIDE_DOMINANCE:
-            return None
-
-        max_single = max(e.notional for e in events)
-        if max_single < AGGRESSIVE_LARGE_NOTIONAL:
+        side = "buy" if buy_notional >= sell_notional else "sell"
+        dominance = max(buy_notional, sell_notional) / total_notional
+        if dominance < TREND_CONFIRM_MIN_DOMINANCE:
             return None
 
         start_price = events[0].price
         end_price = events[-1].price
         move_pct = self._pct_change(start_price, end_price)
+        imbalance = self._book_imbalance(symbol, TREND_CONFIRM_WINDOW_SEC)
 
-        return {
-            "side": dominant_side,
-            "total_notional": total_notional,
-            "dominant_notional": dominant_notional,
-            "side_ratio": side_ratio,
-            "max_single": max_single,
-            "trade_count": len(events),
-            "start_price": start_price,
-            "end_price": end_price,
-            "move_pct": move_pct,
-        }
-
-    def _detect_absorption(self, symbol: str) -> Optional[dict]:
-        trades = self._get_trade_window(symbol, ABSORPTION_WINDOW_SEC)
-        books = self._get_book_window(symbol, ABSORPTION_WINDOW_SEC)
-
-        if len(trades) < 2 or len(books) < ABSORPTION_MIN_BOOK_UPDATES:
-            return None
-
-        if self._is_bot_noise(trades):
-            return None
-
-        buy_notional = sum(e.notional for e in trades if e.side == "buy")
-        sell_notional = sum(e.notional for e in trades if e.side == "sell")
-
-        first_trade_price = trades[0].price
-        last_trade_price = trades[-1].price
-        move_pct = self._pct_change(first_trade_price, last_trade_price)
-
-        if (
-            sell_notional >= ABSORPTION_MIN_NOTIONAL
-            and abs(move_pct) <= ABSORPTION_MAX_PRICE_MOVE_PCT
-            and move_pct > -ABSORPTION_MAX_PRICE_MOVE_PCT
-        ):
-            return {
-                "type": "buy_absorption",
-                "notional": sell_notional,
-                "move_pct": move_pct,
-                "start_price": first_trade_price,
-                "end_price": last_trade_price,
-                "book_updates": len(books),
-            }
-
-        if (
-            buy_notional >= ABSORPTION_MIN_NOTIONAL
-            and abs(move_pct) <= ABSORPTION_MAX_PRICE_MOVE_PCT
-            and move_pct < ABSORPTION_MAX_PRICE_MOVE_PCT
-        ):
-            return {
-                "type": "sell_absorption",
-                "notional": buy_notional,
-                "move_pct": move_pct,
-                "start_price": first_trade_price,
-                "end_price": last_trade_price,
-                "book_updates": len(books),
-            }
+        if side == "buy":
+            if move_pct >= TREND_CONFIRM_MIN_MOVE_PCT and imbalance >= TREND_CONFIRM_MIN_IMBALANCE:
+                return {
+                    "type": "bull_trend_confirmation",
+                    "total_notional": total_notional,
+                    "dominance": dominance,
+                    "move_pct": move_pct,
+                    "imbalance": imbalance,
+                    "start_price": start_price,
+                    "end_price": end_price,
+                    "trade_count": len(events),
+                }
+        else:
+            if move_pct <= -TREND_CONFIRM_MIN_MOVE_PCT and imbalance <= -TREND_CONFIRM_MIN_IMBALANCE:
+                return {
+                    "type": "bear_trend_confirmation",
+                    "total_notional": total_notional,
+                    "dominance": dominance,
+                    "move_pct": move_pct,
+                    "imbalance": imbalance,
+                    "start_price": start_price,
+                    "end_price": end_price,
+                    "trade_count": len(events),
+                }
 
         return None
 
-    async def _alert_aggressive_flow(self, symbol: str, result: dict) -> None:
-        side = result["side"]
-        signal = "买入" if side == "buy" else "卖出"
-        direction = "主动买入" if side == "buy" else "主动卖出"
-
-        msg = (
-            f"【大额主动成交预警】\n"
-            f"币种：{symbol}\n"
-            f"操作建议：{signal}\n"
-            f"成交类型：{direction}\n\n"
-            f"聚合成交额：{result['total_notional']:,.0f} {QUOTE_ASSET}\n"
-            f"主导成交占比：{result['side_ratio'] * 100:.1f}%\n"
-            f"最大单笔成交额：{result['max_single']:,.0f} {QUOTE_ASSET}\n"
-            f"成交笔数：{result['trade_count']}\n"
-            f"价格变化：{result['move_pct']:.2f}%\n"
-            f"价格区间：{result['start_price']} -> {result['end_price']}"
-        )
-        await self._maybe_alert(f"aggressive:{symbol}:{side}", msg)
-
-    async def _alert_absorption(self, symbol: str, result: dict) -> None:
-        if result["type"] == "buy_absorption":
-            signal = "买入 / 观望"
-            title = "【疑似大额限价买单承接】"
-            reason = "主动卖盘成交很多，但价格并未明显下跌"
+    async def _alert_trend_confirmation(self, symbol: str, result: dict) -> None:
+        if result["type"] == "bull_trend_confirmation":
+            title = "【上涨确认】"
+            suggestion = "买入"
+            desc = "主动买盘推动价格上行，且盘口买盘占优"
         else:
-            signal = "卖出 / 观望"
-            title = "【疑似大额限价卖单压盘】"
-            reason = "主动买盘成交很多，但价格并未明显上涨"
+            title = "【下跌确认】"
+            suggestion = "卖出"
+            desc = "主动卖盘推动价格下行，且盘口卖盘占优"
 
         msg = (
             f"{title}\n"
             f"币种：{symbol}\n"
-            f"操作建议：{signal}\n"
-            f"原因：{reason}\n\n"
-            f"成交额：{result['notional']:,.0f} {QUOTE_ASSET}\n"
+            f"操作建议：{suggestion}\n"
+            f"确认原因：{desc}\n\n"
+            f"总成交额：{result['total_notional']:,.0f} {QUOTE_ASSET}\n"
+            f"主导占比：{result['dominance'] * 100:.1f}%\n"
             f"价格变化：{result['move_pct']:.3f}%\n"
-            f"价格区间：{result['start_price']} -> {result['end_price']}\n"
-            f"盘口更新次数：{result['book_updates']}"
+            f"盘口偏向：{result['imbalance']:.3f}\n"
+            f"成交笔数：{result['trade_count']}\n"
+            f"价格区间：{result['start_price']} -> {result['end_price']}"
         )
-        await self._maybe_alert(f"absorption:{symbol}:{result['type']}", msg)
+        await self._maybe_alert(f"trend:{symbol}:{result['type']}", msg)
 
     async def _health(self, request: web.Request) -> web.Response:
         now = time.time()
@@ -688,6 +650,9 @@ class OrderFlowScanner:
         except (TypeError, ValueError):
             return
 
+        if snap.bid <= 0 and snap.ask <= 0:
+            return
+
         self.book_flow[symbol].append(snap)
 
     async def _handle_agg_trade(self, data: dict) -> None:
@@ -721,13 +686,10 @@ class OrderFlowScanner:
         )
         self.trade_flow[symbol].append(event)
 
-        aggressive = self._detect_aggressive_flow(symbol)
-        if aggressive:
-            await self._alert_aggressive_flow(symbol, aggressive)
-
-        absorption = self._detect_absorption(symbol)
-        if absorption:
-            await self._alert_absorption(symbol, absorption)
+        # 只推送确认后的趋势信号
+        trend = self._detect_trend_confirmation(symbol)
+        if trend:
+            await self._alert_trend_confirmation(symbol, trend)
 
     async def _handle_message(self, raw: str) -> None:
         self.runtime.last_message_at = time.time()
@@ -783,7 +745,7 @@ class OrderFlowScanner:
         await self.universe.start()
         await self.universe.refresh()
         self.runtime.universe_size = len(self.universe.allowed_symbols)
-        self._last_universe_refresh = time.time()  # 修复：避免启动后立即再次 refresh
+        self._last_universe_refresh = time.time()
 
         await self.notifier.start()
 
@@ -811,8 +773,7 @@ class OrderFlowScanner:
         await self.notifier.send(
             "【系统启动成功】\n"
             f"{mode_text}\n"
-            "仅监控：大额主动成交 / 疑似限价承接与压盘\n"
-            "不使用涨跌幅、热度分数\n"
+            "监控内容：仅推送确认后的上涨 / 下跌信号\n"
             f"合约币种来源：{source_text}"
         )
 
