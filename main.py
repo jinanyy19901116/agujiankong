@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import math
 import os
 import signal
 import statistics
@@ -34,33 +33,54 @@ TELEGRAM_BOT_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
 TELEGRAM_CHAT_ID = "6308781694"
 
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT").upper()
-TOP_N_FUTURES = int(os.getenv("TOP_N_FUTURES", "50"))
-MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "50000000"))
+TOP_N_FUTURES = int(os.getenv("TOP_N_FUTURES", "20"))
+MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "20000000"))
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "60"))
+
+# 内置默认合约列表：即使部署环境没配置 FUTURES_SYMBOLS，也能跑
+DEFAULT_FUTURES_SYMBOLS = [
+    "JSTUSDT",
+    "ONTUSDT",
+    "SUPERUSDT",
+    "DOGEUSDT",
+    "ONDOUSDT",
+    "JTOUSDT",
+    "ADAUSDT",
+    "HIVEUSDT",
+    "SUIUSDT",
+    "ENAUSDT",
+    "SEIUSDT",
+    "WIFUSDT",
+    "1000PEPEUSDT",
+    "ARBUSDT",
+    "OPUSDT",
+    "APTUSDT",
+    "NEARUSDT",
+    "INJUSDT",
+    "TIAUSDT",
+]
 
 # ==================== 即时大额市价单监控 ====================
 FLOW_WINDOW_SEC = float(os.getenv("FLOW_WINDOW_SEC", "1.5"))
-FLOW_MIN_TOTAL_NOTIONAL = float(os.getenv("FLOW_MIN_TOTAL_NOTIONAL", "120000"))
+FLOW_MIN_TOTAL_NOTIONAL = float(os.getenv("FLOW_MIN_TOTAL_NOTIONAL", "100000"))
 FLOW_MIN_DOMINANCE = float(os.getenv("FLOW_MIN_DOMINANCE", "0.75"))
 FLOW_MIN_TRADE_COUNT = int(os.getenv("FLOW_MIN_TRADE_COUNT", "2"))
-FLOW_SINGLE_LARGE_NOTIONAL = float(os.getenv("FLOW_SINGLE_LARGE_NOTIONAL", "50000"))
+FLOW_SINGLE_LARGE_NOTIONAL = float(os.getenv("FLOW_SINGLE_LARGE_NOTIONAL", "40000"))
 FLOW_BALANCE_NOISE_MAX_DOMINANCE = float(os.getenv("FLOW_BALANCE_NOISE_MAX_DOMINANCE", "0.58"))
 
 # 单笔超大单，独立秒推
-SINGLE_PRINT_NOTIONAL = float(os.getenv("SINGLE_PRINT_NOTIONAL", "100000"))
+SINGLE_PRINT_NOTIONAL = float(os.getenv("SINGLE_PRINT_NOTIONAL", "80000"))
 
 # ==================== 机器人/套利噪音过滤 ====================
 BOT_MAX_MICRO_NOTIONAL = float(os.getenv("BOT_MAX_MICRO_NOTIONAL", "3000"))
 BOT_ALTERNATING_COUNT = int(os.getenv("BOT_ALTERNATING_COUNT", "8"))
 BOT_BURST_WINDOW_SEC = float(os.getenv("BOT_BURST_WINDOW_SEC", "2.0"))
 
-# 固定手数/固定金额刷单
 BOT_REPEAT_SAMPLE_SIZE = int(os.getenv("BOT_REPEAT_SAMPLE_SIZE", "8"))
 BOT_REPEAT_QTY_UNIQUENESS_MAX = int(os.getenv("BOT_REPEAT_QTY_UNIQUENESS_MAX", "2"))
 BOT_REPEAT_NOTIONAL_UNIQUENESS_MAX = int(os.getenv("BOT_REPEAT_NOTIONAL_UNIQUENESS_MAX", "2"))
 BOT_REPEAT_WINDOW_SEC = float(os.getenv("BOT_REPEAT_WINDOW_SEC", "2.0"))
 
-# 固定节奏机器人
 BOT_TIMING_SAMPLE_SIZE = int(os.getenv("BOT_TIMING_SAMPLE_SIZE", "8"))
 BOT_TIMING_STD_MAX = float(os.getenv("BOT_TIMING_STD_MAX", "0.035"))
 BOT_TIMING_WINDOW_SEC = float(os.getenv("BOT_TIMING_WINDOW_SEC", "2.0"))
@@ -145,7 +165,7 @@ class FuturesUniverse:
 
         self.all_symbols: Set[str] = set()
         self.allowed_symbols: Set[str] = set()
-        self.source: str = "unknown"  # api / env / missing_env / error
+        self.source: str = "unknown"  # api / env / default / error
 
     async def start(self) -> None:
         if self.session is None:
@@ -157,17 +177,17 @@ class FuturesUniverse:
             await self.session.close()
             self.session = None
 
-    def _load_futures_symbols_from_env(self) -> Set[str]:
+    def _load_futures_symbols(self) -> Set[str]:
         raw = os.getenv("FUTURES_SYMBOLS", "").strip()
-        if not raw:
-            return set()
-        return {s.strip().upper() for s in raw.split(",") if s.strip()}
+        if raw:
+            return {s.strip().upper() for s in raw.split(",") if s.strip()}
+        return set(DEFAULT_FUTURES_SYMBOLS)
 
     async def _fetch_futures_exchange_info(self) -> Set[str]:
         if self.session is None:
             await self.start()
 
-        env_symbols = self._load_futures_symbols_from_env()
+        fallback_symbols = self._load_futures_symbols()
         url = f"{self.futures_rest_base}/fapi/v1/exchangeInfo"
 
         try:
@@ -175,24 +195,31 @@ class FuturesUniverse:
                 text = await resp.text()
 
                 if resp.status == 451:
-                    if env_symbols:
-                        self.source = "env"
-                        logging.info("期货API返回451，已改用 FUTURES_SYMBOLS，共 %s 个币种", len(env_symbols))
-                        return env_symbols
+                    if fallback_symbols:
+                        self.source = "default" if not os.getenv("FUTURES_SYMBOLS", "").strip() else "env"
+                        logging.warning(
+                            "期货API返回451，已改用%s合约列表，共 %s 个币种",
+                            "内置默认" if self.source == "default" else "FUTURES_SYMBOLS",
+                            len(fallback_symbols),
+                        )
+                        return fallback_symbols
 
-                    self.source = "missing_env"
-                    logging.warning("期货API返回451，且未设置 FUTURES_SYMBOLS。纯合约模式下当前无法监控。")
+                    self.source = "error"
+                    logging.warning("期货API返回451，且没有任何可用的回退合约列表。")
                     return set()
 
                 if resp.status != 200:
                     self.source = "error"
                     logging.warning("Futures exchangeInfo 非200: status=%s body=%s", resp.status, text[:300])
 
-                    if env_symbols:
-                        self.source = "env"
-                        logging.info("已改用 FUTURES_SYMBOLS，共 %s 个币种", len(env_symbols))
-                        return env_symbols
-
+                    if fallback_symbols:
+                        self.source = "default" if not os.getenv("FUTURES_SYMBOLS", "").strip() else "env"
+                        logging.warning(
+                            "exchangeInfo 获取失败，已改用%s合约列表，共 %s 个币种",
+                            "内置默认" if self.source == "default" else "FUTURES_SYMBOLS",
+                            len(fallback_symbols),
+                        )
+                        return fallback_symbols
                     return set()
 
                 try:
@@ -201,21 +228,27 @@ class FuturesUniverse:
                     self.source = "error"
                     logging.warning("Futures exchangeInfo 返回的不是JSON: %s", text[:300])
 
-                    if env_symbols:
-                        self.source = "env"
-                        logging.info("已改用 FUTURES_SYMBOLS，共 %s 个币种", len(env_symbols))
-                        return env_symbols
-
+                    if fallback_symbols:
+                        self.source = "default" if not os.getenv("FUTURES_SYMBOLS", "").strip() else "env"
+                        logging.warning(
+                            "JSON解析失败，已改用%s合约列表，共 %s 个币种",
+                            "内置默认" if self.source == "default" else "FUTURES_SYMBOLS",
+                            len(fallback_symbols),
+                        )
+                        return fallback_symbols
                     return set()
 
         except Exception:
-            if env_symbols:
-                self.source = "env"
-                logging.exception("获取 Futures exchangeInfo 失败，已改用 FUTURES_SYMBOLS")
-                return env_symbols
+            if fallback_symbols:
+                self.source = "default" if not os.getenv("FUTURES_SYMBOLS", "").strip() else "env"
+                logging.exception(
+                    "获取 Futures exchangeInfo 失败，已改用%s合约列表",
+                    "内置默认" if self.source == "default" else "FUTURES_SYMBOLS",
+                )
+                return fallback_symbols
 
             self.source = "error"
-            logging.exception("获取 Futures exchangeInfo 失败，且没有 FUTURES_SYMBOLS")
+            logging.exception("获取 Futures exchangeInfo 失败，且没有任何可用的回退合约列表")
             return set()
 
         symbols: Set[str] = set()
@@ -274,6 +307,16 @@ class FuturesUniverse:
         if not symbols:
             self.allowed_symbols = set()
             logging.warning("纯合约模式：当前可监控合约为空，source=%s", self.source)
+            return
+
+        # 如果不是 API 拿到的，而是 fallback 列表，直接用 fallback 列表
+        if self.source in {"env", "default"}:
+            self.allowed_symbols = set(list(symbols)[:TOP_N_FUTURES])
+            logging.info(
+                "纯合约交易池刷新完成：使用%s合约列表，最终订阅=%s",
+                "内置默认" if self.source == "default" else "FUTURES_SYMBOLS",
+                len(self.allowed_symbols),
+            )
             return
 
         tickers = await self._fetch_futures_24h_tickers()
@@ -439,7 +482,6 @@ class FuturesOrderFlowScanner:
         if self._is_uniform_timing_bot(events):
             return True
 
-        # 双边过于均衡，常见于对敲/套利/刷量噪音
         buy_notional = sum(e.notional for e in events if e.side == "buy")
         sell_notional = sum(e.notional for e in events if e.side == "sell")
         total_notional = buy_notional + sell_notional
@@ -456,7 +498,6 @@ class FuturesOrderFlowScanner:
         if event.notional < SINGLE_PRINT_NOTIONAL:
             return None
 
-        # 单笔超大单也要防机器人：如果最近窗口明显是机械噪音，就忽略
         recent = self._get_trade_window(symbol, 1.2)
         if self._is_bot_or_arb_noise(recent):
             return None
@@ -567,6 +608,7 @@ class FuturesOrderFlowScanner:
             "universe_size": self.runtime.universe_size,
             "subscribed_count": self.runtime.subscribed_count,
             "futures_source": self.universe.source,
+            "active_symbols": sorted(self.active_symbols),
             "last_error": self.runtime.last_error,
         })
 
@@ -706,7 +748,7 @@ class FuturesOrderFlowScanner:
 
     async def _idle_until_universe_available(self) -> None:
         while not self._stop_event.is_set() and not self.universe.allowed_symbols:
-            logging.info("当前无可监控合约，%s 秒后重试刷新 Universe", EMPTY_UNIVERSE_RETRY_SEC)
+            logging.info("当前无可监控合约，%s 秒后重试刷新交易池", EMPTY_UNIVERSE_RETRY_SEC)
             await asyncio.sleep(EMPTY_UNIVERSE_RETRY_SEC)
             await self.universe.refresh()
             self.runtime.universe_size = len(self.universe.allowed_symbols)
@@ -726,7 +768,7 @@ class FuturesOrderFlowScanner:
         source_map = {
             "api": "Binance Futures API",
             "env": "环境变量 FUTURES_SYMBOLS",
-            "missing_env": "未提供 FUTURES_SYMBOLS",
+            "default": "内置默认合约列表",
             "error": "Futures 获取失败",
         }
         source_text = source_map.get(self.universe.source, "未知")
@@ -740,12 +782,14 @@ class FuturesOrderFlowScanner:
             f"合约来源：{source_text}"
         )
 
-        if not self.universe.allowed_symbols:
+        if self.universe.allowed_symbols:
+            logging.info("当前可监控合约: %s", ", ".join(sorted(self.universe.allowed_symbols)))
+        else:
             await self.notifier.send(
                 "【配置提醒】\n"
                 "当前没有可监控合约。\n"
-                "如果 Futures API 返回 451，请设置 FUTURES_SYMBOLS，"
-                "或者更换可访问 Binance Futures 的网络/IP。"
+                "请检查网络是否能访问 Binance Futures，"
+                "或者确认代码中的默认合约列表是否被保留。"
             )
 
         await self._run()
@@ -764,7 +808,6 @@ class FuturesOrderFlowScanner:
 
         while not self._stop_event.is_set():
             try:
-                # 没有可监控合约时，不去无意义连接 WS
                 if not self.universe.allowed_symbols:
                     self.runtime.connected = False
                     await self._idle_until_universe_available()
@@ -784,7 +827,6 @@ class FuturesOrderFlowScanner:
                     self.runtime.last_error = ""
                     logging.info("Futures WebSocket 已连接")
 
-                    # 占位订阅去掉，然后直接应用当前已有 Universe，不再重复 refresh
                     await self._unsubscribe_streams(["btcusdt@aggTrade"])
                     await self._apply_active_symbols(set(sorted(self.universe.allowed_symbols)))
 
