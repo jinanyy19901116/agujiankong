@@ -12,7 +12,7 @@ from typing import Deque, Dict, List, Optional, Set
 import aiohttp
 from aiohttp import web
 import websockets
-from websockets.exceptions import InvalidStatus
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 
 # =========================================================
@@ -20,7 +20,8 @@ from websockets.exceptions import InvalidStatus
 # =========================================================
 
 FUTURES_REST_BASE = os.getenv("FUTURES_REST_BASE", "https://fapi.binance.com").rstrip("/")
-FUTURES_WS_BASE = os.getenv("FUTURES_WS_BASE", "wss://fstream.binance.com/stream?streams=").strip()
+# 改为基地址，连接时直接使用 /ws，不再使用占位 stream
+FUTURES_WS_ORIGIN = os.getenv("FUTURES_WS_ORIGIN", "wss://fstream.binance.com").rstrip("/")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PORT = int(os.getenv("PORT", "8080"))
@@ -37,7 +38,7 @@ TOP_N_FUTURES = int(os.getenv("TOP_N_FUTURES", "20"))
 MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "20000000"))
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "60"))
 
-# 内置默认合约列表：即使部署环境没配置 FUTURES_SYMBOLS，也能跑
+# 内置默认合约列表：即使环境变量没配也能跑
 DEFAULT_FUTURES_SYMBOLS = [
     "JSTUSDT",
     "ONTUSDT",
@@ -84,6 +85,9 @@ BOT_REPEAT_WINDOW_SEC = float(os.getenv("BOT_REPEAT_WINDOW_SEC", "2.0"))
 BOT_TIMING_SAMPLE_SIZE = int(os.getenv("BOT_TIMING_SAMPLE_SIZE", "8"))
 BOT_TIMING_STD_MAX = float(os.getenv("BOT_TIMING_STD_MAX", "0.035"))
 BOT_TIMING_WINDOW_SEC = float(os.getenv("BOT_TIMING_WINDOW_SEC", "2.0"))
+
+# 批量订阅，降低无效请求/频繁控制消息风险
+MAX_STREAMS_PER_BATCH = int(os.getenv("MAX_STREAMS_PER_BATCH", "80"))
 
 
 # =========================================================
@@ -309,7 +313,6 @@ class FuturesUniverse:
             logging.warning("纯合约模式：当前可监控合约为空，source=%s", self.source)
             return
 
-        # 如果不是 API 拿到的，而是 fallback 列表，直接用 fallback 列表
         if self.source in {"env", "default"}:
             self.allowed_symbols = set(list(symbols)[:TOP_N_FUTURES])
             logging.info(
@@ -427,7 +430,6 @@ class FuturesOrderFlowScanner:
 
         qty_keys = {round(e.qty, 6) for e in recent}
         notional_keys = {round(e.notional, 1) for e in recent}
-
         same_side_ratio = max(
             sum(1 for e in recent if e.side == "buy"),
             sum(1 for e in recent if e.side == "sell"),
@@ -475,10 +477,8 @@ class FuturesOrderFlowScanner:
 
         if self._is_alternating_micro_bot(events):
             return True
-
         if self._is_repetitive_size_bot(events):
             return True
-
         if self._is_uniform_timing_bot(events):
             return True
 
@@ -515,7 +515,6 @@ class FuturesOrderFlowScanner:
 
         if len(events) < FLOW_MIN_TRADE_COUNT:
             return None
-
         if self._is_bot_or_arb_noise(events):
             return None
 
@@ -626,27 +625,29 @@ class FuturesOrderFlowScanner:
         await site.start()
         logging.info("健康检查服务已启动: 0.0.0.0:%s", PORT)
 
-    async def _subscribe_streams(self, params: List[str]) -> None:
+    @staticmethod
+    def _chunked(items: List[str], size: int) -> List[List[str]]:
+        return [items[i:i + size] for i in range(0, len(items), size)]
+
+    async def _send_ws_control(self, method: str, params: List[str]) -> None:
         if not params or self.ws is None:
             return
-        req = {
-            "method": "SUBSCRIBE",
-            "params": params,
-            "id": int(time.time() * 1000) % 100000000,
-        }
-        await self.ws.send(json.dumps(req))
-        logging.info("已发送订阅请求: %s", ", ".join(params))
+
+        for batch in self._chunked(params, MAX_STREAMS_PER_BATCH):
+            req = {
+                "method": method,
+                "params": batch,
+                "id": int(time.time() * 1000) % 100000000,
+            }
+            await self.ws.send(json.dumps(req))
+            logging.info("已发送%s请求: %s", method, ", ".join(batch))
+            await asyncio.sleep(0.15)
+
+    async def _subscribe_streams(self, params: List[str]) -> None:
+        await self._send_ws_control("SUBSCRIBE", params)
 
     async def _unsubscribe_streams(self, params: List[str]) -> None:
-        if not params or self.ws is None:
-            return
-        req = {
-            "method": "UNSUBSCRIBE",
-            "params": params,
-            "id": int(time.time() * 1000) % 100000000,
-        }
-        await self.ws.send(json.dumps(req))
-        logging.info("已发送取消订阅请求: %s", ", ".join(params))
+        await self._send_ws_control("UNSUBSCRIBE", params)
 
     async def _handle_control_response(self, payload: dict) -> None:
         if "result" in payload:
@@ -735,8 +736,14 @@ class FuturesOrderFlowScanner:
         stream = payload.get("stream", "")
         data = payload.get("data")
 
-        if isinstance(stream, str) and stream.endswith("@aggTrade"):
+        # raw 模式下也兼容没有 stream 包装的情况
+        if isinstance(data, dict) and isinstance(stream, str) and stream.endswith("@aggTrade"):
             await self._handle_agg_trade(data)
+            return
+
+        event_type = payload.get("e")
+        if event_type == "aggTrade":
+            await self._handle_agg_trade(payload)
 
     async def _periodic_universe_refresh(self) -> None:
         now = time.time()
@@ -804,7 +811,8 @@ class FuturesOrderFlowScanner:
             self.health_runner = None
 
     async def _run(self) -> None:
-        self.runtime.ws_url = FUTURES_WS_BASE
+        ws_url = f"{FUTURES_WS_ORIGIN}/ws"
+        self.runtime.ws_url = ws_url
 
         while not self._stop_event.is_set():
             try:
@@ -813,10 +821,10 @@ class FuturesOrderFlowScanner:
                     await self._idle_until_universe_available()
                     continue
 
-                logging.info("正在连接 Futures WebSocket")
+                logging.info("正在连接 Futures WebSocket: %s", ws_url)
 
                 async with websockets.connect(
-                    FUTURES_WS_BASE + "btcusdt@aggTrade",
+                    ws_url,
                     ping_interval=20,
                     ping_timeout=20,
                     close_timeout=10,
@@ -827,17 +835,20 @@ class FuturesOrderFlowScanner:
                     self.runtime.last_error = ""
                     logging.info("Futures WebSocket 已连接")
 
-                    await self._unsubscribe_streams(["btcusdt@aggTrade"])
+                    # 直接批量订阅当前交易池，不再使用占位流
                     await self._apply_active_symbols(set(sorted(self.universe.allowed_symbols)))
 
                     while not self._stop_event.is_set():
                         try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=10)
+                            msg = await asyncio.wait_for(ws.recv(), timeout=30)
                             await self._handle_message(msg)
                             await self._periodic_universe_refresh()
                         except asyncio.TimeoutError:
                             await self._periodic_universe_refresh()
                             continue
+                        except ConnectionClosed as e:
+                            self.runtime.last_error = f"ConnectionClosed: code={e.code} reason={e.reason}"
+                            raise
 
             except InvalidStatus as e:
                 self.runtime.connected = False
