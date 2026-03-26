@@ -10,13 +10,10 @@ from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional
 
 import aiohttp
+from aiohttp import web
 import websockets
 from websockets.exceptions import InvalidStatus
 
-
-# =========================
-# 配置
-# =========================
 
 PRIMARY_WS_BASE = os.getenv(
     "PRIMARY_WS_BASE",
@@ -53,10 +50,6 @@ ENABLE_HEALTHCHECK = os.getenv("ENABLE_HEALTHCHECK", "true").lower() == "true"
 PORT = int(os.getenv("PORT", "8080"))
 
 
-# =========================
-# 数据结构
-# =========================
-
 @dataclass
 class TradePoint:
     ts: float
@@ -89,10 +82,6 @@ class RuntimeStatus:
     fallback_in_use: bool = False
     last_error: str = ""
 
-
-# =========================
-# 通知器
-# =========================
 
 class TelegramNotifier:
     def __init__(self, bot_token: str, chat_id: str):
@@ -136,10 +125,6 @@ class TelegramNotifier:
             logging.exception("Telegram send exception")
 
 
-# =========================
-# 告警管理
-# =========================
-
 class AlertManager:
     def __init__(self, notifier: TelegramNotifier):
         self.notifier = notifier
@@ -157,18 +142,14 @@ class AlertManager:
         await self.notifier.send(full_message)
 
 
-# =========================
-# 健康检查 HTTP 服务
-# =========================
-
 class HealthServer:
     def __init__(self, runtime_status: RuntimeStatus, states: Dict[str, SymbolState]):
         self.runtime_status = runtime_status
         self.states = states
-        self.runner: Optional[aiohttp.web_runner.AppRunner] = None
-        self.site: Optional[aiohttp.web_runner.TCPSite] = None
+        self.runner: Optional[web.AppRunner] = None
+        self.site: Optional[web.TCPSite] = None
 
-    async def handle_health(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
+    async def handle_health(self, request: web.Request) -> web.Response:
         now = time.time()
         data = {
             "ok": True,
@@ -191,14 +172,12 @@ class HealthServer:
                 for symbol, state in self.states.items()
             },
         }
-        return aiohttp.web.json_response(data)
+        return web.json_response(data)
 
-    async def handle_root(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
-        return aiohttp.web.Response(text="crypto-monitor is running")
+    async def handle_root(self, request: web.Request) -> web.Response:
+        return web.Response(text="crypto-monitor is running")
 
     async def start(self) -> None:
-        from aiohttp import web
-
         app = web.Application()
         app.router.add_get("/", self.handle_root)
         app.router.add_get("/health", self.handle_health)
@@ -216,10 +195,6 @@ class HealthServer:
             self.runner = None
             self.site = None
 
-
-# =========================
-# 核心监控器
-# =========================
 
 class CryptoMonitor:
     def __init__(self, symbols: List[str]):
@@ -269,7 +244,6 @@ class CryptoMonitor:
             return
 
         pct_change = (latest.price - oldest.price) / oldest.price * 100
-
         if abs(pct_change) >= PRICE_CHANGE_THRESHOLD_PCT:
             direction = "上涨" if pct_change > 0 else "下跌"
             await self.alert_manager.alert(
@@ -459,10 +433,6 @@ class CryptoMonitor:
         await self.health_server.close()
         await self.notifier.close()
 
-
-# =========================
-# 启动
-# =========================
 
 def setup_logging() -> None:
     logging.basicConfig(
