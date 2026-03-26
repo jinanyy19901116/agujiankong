@@ -1,8 +1,10 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
+import statistics
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -26,9 +28,10 @@ PORT = int(os.getenv("PORT", "8080"))
 ENABLE_HEALTHCHECK = os.getenv("ENABLE_HEALTHCHECK", "true").lower() == "true"
 RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "5"))
 UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC", "1800"))
+EMPTY_UNIVERSE_RETRY_SEC = int(os.getenv("EMPTY_UNIVERSE_RETRY_SEC", "60"))
 
 TELEGRAM_BOT_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
-TELEGRAM_CHAT_ID =  "6308781694"
+TELEGRAM_CHAT_ID = "6308781694"
 
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT").upper()
 TOP_N_FUTURES = int(os.getenv("TOP_N_FUTURES", "50"))
@@ -41,14 +44,26 @@ FLOW_MIN_TOTAL_NOTIONAL = float(os.getenv("FLOW_MIN_TOTAL_NOTIONAL", "120000"))
 FLOW_MIN_DOMINANCE = float(os.getenv("FLOW_MIN_DOMINANCE", "0.75"))
 FLOW_MIN_TRADE_COUNT = int(os.getenv("FLOW_MIN_TRADE_COUNT", "2"))
 FLOW_SINGLE_LARGE_NOTIONAL = float(os.getenv("FLOW_SINGLE_LARGE_NOTIONAL", "50000"))
+FLOW_BALANCE_NOISE_MAX_DOMINANCE = float(os.getenv("FLOW_BALANCE_NOISE_MAX_DOMINANCE", "0.58"))
 
 # 单笔超大单，独立秒推
 SINGLE_PRINT_NOTIONAL = float(os.getenv("SINGLE_PRINT_NOTIONAL", "100000"))
 
-# 机器人噪音过滤
+# ==================== 机器人/套利噪音过滤 ====================
 BOT_MAX_MICRO_NOTIONAL = float(os.getenv("BOT_MAX_MICRO_NOTIONAL", "3000"))
 BOT_ALTERNATING_COUNT = int(os.getenv("BOT_ALTERNATING_COUNT", "8"))
 BOT_BURST_WINDOW_SEC = float(os.getenv("BOT_BURST_WINDOW_SEC", "2.0"))
+
+# 固定手数/固定金额刷单
+BOT_REPEAT_SAMPLE_SIZE = int(os.getenv("BOT_REPEAT_SAMPLE_SIZE", "8"))
+BOT_REPEAT_QTY_UNIQUENESS_MAX = int(os.getenv("BOT_REPEAT_QTY_UNIQUENESS_MAX", "2"))
+BOT_REPEAT_NOTIONAL_UNIQUENESS_MAX = int(os.getenv("BOT_REPEAT_NOTIONAL_UNIQUENESS_MAX", "2"))
+BOT_REPEAT_WINDOW_SEC = float(os.getenv("BOT_REPEAT_WINDOW_SEC", "2.0"))
+
+# 固定节奏机器人
+BOT_TIMING_SAMPLE_SIZE = int(os.getenv("BOT_TIMING_SAMPLE_SIZE", "8"))
+BOT_TIMING_STD_MAX = float(os.getenv("BOT_TIMING_STD_MAX", "0.035"))
+BOT_TIMING_WINDOW_SEC = float(os.getenv("BOT_TIMING_WINDOW_SEC", "2.0"))
 
 
 # =========================================================
@@ -337,17 +352,6 @@ class FuturesOrderFlowScanner:
         logging.warning(text.replace("\n", " | "))
         await self.notifier.send(text)
 
-    def _is_bot_noise(self, events: List[AggTradeEvent]) -> bool:
-        micro = [e for e in events if e.notional <= BOT_MAX_MICRO_NOTIONAL]
-        if len(micro) < BOT_ALTERNATING_COUNT:
-            return False
-
-        recent = micro[-BOT_ALTERNATING_COUNT:]
-        sides = [e.side for e in recent]
-        alternating = sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1])
-        span = recent[-1].ts - recent[0].ts
-        return alternating >= BOT_ALTERNATING_COUNT - 1 and span <= BOT_BURST_WINDOW_SEC
-
     def _get_trade_window(self, symbol: str, sec: float) -> List[AggTradeEvent]:
         now = time.time()
         dq = self.trade_flow[symbol]
@@ -358,8 +362,103 @@ class FuturesOrderFlowScanner:
 
         return [x for x in dq if x.ts >= now - sec]
 
+    def _is_alternating_micro_bot(self, events: List[AggTradeEvent]) -> bool:
+        micro = [e for e in events if e.notional <= BOT_MAX_MICRO_NOTIONAL]
+        if len(micro) < BOT_ALTERNATING_COUNT:
+            return False
+
+        recent = micro[-BOT_ALTERNATING_COUNT:]
+        sides = [e.side for e in recent]
+        alternating = sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1])
+        span = recent[-1].ts - recent[0].ts
+        return alternating >= BOT_ALTERNATING_COUNT - 1 and span <= BOT_BURST_WINDOW_SEC
+
+    def _is_repetitive_size_bot(self, events: List[AggTradeEvent]) -> bool:
+        if len(events) < BOT_REPEAT_SAMPLE_SIZE:
+            return False
+
+        recent = events[-BOT_REPEAT_SAMPLE_SIZE:]
+        span = recent[-1].ts - recent[0].ts
+        if span > BOT_REPEAT_WINDOW_SEC:
+            return False
+
+        qty_keys = {round(e.qty, 6) for e in recent}
+        notional_keys = {round(e.notional, 1) for e in recent}
+
+        same_side_ratio = max(
+            sum(1 for e in recent if e.side == "buy"),
+            sum(1 for e in recent if e.side == "sell"),
+        ) / len(recent)
+
+        return (
+            len(qty_keys) <= BOT_REPEAT_QTY_UNIQUENESS_MAX
+            and len(notional_keys) <= BOT_REPEAT_NOTIONAL_UNIQUENESS_MAX
+            and same_side_ratio < 0.95
+        )
+
+    def _is_uniform_timing_bot(self, events: List[AggTradeEvent]) -> bool:
+        if len(events) < BOT_TIMING_SAMPLE_SIZE:
+            return False
+
+        recent = events[-BOT_TIMING_SAMPLE_SIZE:]
+        span = recent[-1].ts - recent[0].ts
+        if span > BOT_TIMING_WINDOW_SEC:
+            return False
+
+        intervals = []
+        for i in range(1, len(recent)):
+            dt = recent[i].ts - recent[i - 1].ts
+            if dt > 0:
+                intervals.append(dt)
+
+        if len(intervals) < BOT_TIMING_SAMPLE_SIZE - 1:
+            return False
+
+        try:
+            std = statistics.pstdev(intervals)
+        except statistics.StatisticsError:
+            return False
+
+        mean_notional = sum(e.notional for e in recent) / len(recent)
+        side_balance = abs(
+            sum(1 for e in recent if e.side == "buy") - sum(1 for e in recent if e.side == "sell")
+        ) / len(recent)
+
+        return std <= BOT_TIMING_STD_MAX and mean_notional <= FLOW_SINGLE_LARGE_NOTIONAL and side_balance < 0.75
+
+    def _is_bot_or_arb_noise(self, events: List[AggTradeEvent]) -> bool:
+        if not events:
+            return False
+
+        if self._is_alternating_micro_bot(events):
+            return True
+
+        if self._is_repetitive_size_bot(events):
+            return True
+
+        if self._is_uniform_timing_bot(events):
+            return True
+
+        # 双边过于均衡，常见于对敲/套利/刷量噪音
+        buy_notional = sum(e.notional for e in events if e.side == "buy")
+        sell_notional = sum(e.notional for e in events if e.side == "sell")
+        total_notional = buy_notional + sell_notional
+        if total_notional <= 0:
+            return True
+
+        dominance = max(buy_notional, sell_notional) / total_notional
+        if dominance <= FLOW_BALANCE_NOISE_MAX_DOMINANCE:
+            return True
+
+        return False
+
     def _detect_single_large_market_order(self, symbol: str, event: AggTradeEvent) -> Optional[dict]:
         if event.notional < SINGLE_PRINT_NOTIONAL:
+            return None
+
+        # 单笔超大单也要防机器人：如果最近窗口明显是机械噪音，就忽略
+        recent = self._get_trade_window(symbol, 1.2)
+        if self._is_bot_or_arb_noise(recent):
             return None
 
         return {
@@ -375,7 +474,8 @@ class FuturesOrderFlowScanner:
 
         if len(events) < FLOW_MIN_TRADE_COUNT:
             return None
-        if self._is_bot_noise(events):
+
+        if self._is_bot_or_arb_noise(events):
             return None
 
         buy_notional = sum(e.notional for e in events if e.side == "buy")
@@ -513,11 +613,7 @@ class FuturesOrderFlowScanner:
             else:
                 logging.info("WebSocket 控制响应: %s", payload)
 
-    async def _refresh_active_symbols(self) -> None:
-        await self.universe.refresh()
-        self.runtime.universe_size = len(self.universe.allowed_symbols)
-
-        next_set = set(sorted(self.universe.allowed_symbols))
+    async def _apply_active_symbols(self, next_set: Set[str]) -> None:
         added = next_set - self.active_symbols
         removed = self.active_symbols - next_set
 
@@ -531,6 +627,11 @@ class FuturesOrderFlowScanner:
 
         self.active_symbols = next_set
         self.runtime.subscribed_count = len(self.active_symbols)
+
+    async def _refresh_active_symbols(self) -> None:
+        await self.universe.refresh()
+        self.runtime.universe_size = len(self.universe.allowed_symbols)
+        await self._apply_active_symbols(set(sorted(self.universe.allowed_symbols)))
 
     async def _handle_agg_trade(self, data: dict) -> None:
         if not isinstance(data, dict):
@@ -603,6 +704,14 @@ class FuturesOrderFlowScanner:
         self._last_universe_refresh = now
         await self._refresh_active_symbols()
 
+    async def _idle_until_universe_available(self) -> None:
+        while not self._stop_event.is_set() and not self.universe.allowed_symbols:
+            logging.info("当前无可监控合约，%s 秒后重试刷新 Universe", EMPTY_UNIVERSE_RETRY_SEC)
+            await asyncio.sleep(EMPTY_UNIVERSE_RETRY_SEC)
+            await self.universe.refresh()
+            self.runtime.universe_size = len(self.universe.allowed_symbols)
+            self._last_universe_refresh = time.time()
+
     async def start(self) -> None:
         await self.universe.start()
         await self.notifier.start()
@@ -626,6 +735,7 @@ class FuturesOrderFlowScanner:
             "【系统启动成功】\n"
             "模式：纯合约即时主动成交监控\n"
             "仅推送：超大市价单 / 短时大额主动买卖簇\n"
+            "已启用：刷单机器人 / 套利噪音过滤\n"
             f"当前合约数量：{len(self.universe.allowed_symbols)}\n"
             f"合约来源：{source_text}"
         )
@@ -654,6 +764,12 @@ class FuturesOrderFlowScanner:
 
         while not self._stop_event.is_set():
             try:
+                # 没有可监控合约时，不去无意义连接 WS
+                if not self.universe.allowed_symbols:
+                    self.runtime.connected = False
+                    await self._idle_until_universe_available()
+                    continue
+
                 logging.info("正在连接 Futures WebSocket")
 
                 async with websockets.connect(
@@ -668,8 +784,9 @@ class FuturesOrderFlowScanner:
                     self.runtime.last_error = ""
                     logging.info("Futures WebSocket 已连接")
 
+                    # 占位订阅去掉，然后直接应用当前已有 Universe，不再重复 refresh
                     await self._unsubscribe_streams(["btcusdt@aggTrade"])
-                    await self._refresh_active_symbols()
+                    await self._apply_active_symbols(set(sorted(self.universe.allowed_symbols)))
 
                     while not self._stop_event.is_set():
                         try:
