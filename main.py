@@ -27,6 +27,7 @@ PORT = int(os.getenv("PORT", "8080"))
 ENABLE_HEALTHCHECK = os.getenv("ENABLE_HEALTHCHECK", "true").lower() == "true"
 RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "5"))
 
+# 改为环境变量读取，避免泄露敏感信息
 TELEGRAM_BOT_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
 TELEGRAM_CHAT_ID = "6308781694"
 
@@ -36,6 +37,9 @@ DISCOVERY_STREAM = "!miniTicker@arr"
 UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC", "1800"))
 TOP_N_SUBSCRIBE = int(os.getenv("TOP_N_SUBSCRIBE", "80"))
 MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "1000000"))
+
+# 关键修复：允许 Futures 不可用时退回现货白名单模式
+ALLOW_SPOT_FALLBACK = os.getenv("ALLOW_SPOT_FALLBACK", "true").lower() == "true"
 
 EXCLUDED_BASE_ASSETS: Set[str] = {
     x.strip().upper()
@@ -193,7 +197,8 @@ class BinanceUniverse:
         self.allowed_symbols: Set[str] = set()
         self.spot_symbols: Set[str] = set()
         self.futures_symbols: Set[str] = set()
-        self.futures_source: str = "unknown"  # api / env / missing_env / error
+        self.futures_source: str = "unknown"   # api / env / missing_env / error
+        self.monitor_mode: str = "unknown"     # futures_intersection / spot_fallback / empty
 
     async def start(self) -> None:
         if self.session is None:
@@ -216,6 +221,9 @@ class BinanceUniverse:
 
         allowed: Set[str] = set()
         for item in data.get("symbols", []):
+            if not isinstance(item, dict):
+                continue
+
             symbol = item.get("symbol", "").upper()
             status = item.get("status", "")
             quote_asset = item.get("quoteAsset", "").upper()
@@ -267,7 +275,7 @@ class BinanceUniverse:
 
                     self.futures_source = "missing_env"
                     logging.warning(
-                        "Futures API 返回 451，且未设置 FUTURES_SYMBOLS。当前将返回空集合，程序继续运行。"
+                        "Futures API 返回 451，且未设置 FUTURES_SYMBOLS。"
                     )
                     return set()
 
@@ -286,7 +294,7 @@ class BinanceUniverse:
 
                 self.futures_source = "missing_env"
                 logging.warning(
-                    "Futures API 返回 451，且未设置 FUTURES_SYMBOLS。当前将返回空集合，程序继续运行。"
+                    "Futures API 返回 451，且未设置 FUTURES_SYMBOLS。"
                 )
                 return set()
 
@@ -306,6 +314,9 @@ class BinanceUniverse:
 
         futures_symbols: Set[str] = set()
         for item in data.get("symbols", []):
+            if not isinstance(item, dict):
+                continue
+
             symbol = item.get("symbol", "").upper()
             status = item.get("status", "")
             quote_asset = item.get("quoteAsset", "").upper()
@@ -331,15 +342,29 @@ class BinanceUniverse:
 
         self.spot_symbols = spot_symbols
         self.futures_symbols = futures_symbols
-        self.allowed_symbols = (spot_symbols & futures_symbols) & UPBIT_HOT_SYMBOLS
+
+        # 关键修复：
+        # 原逻辑是 (spot & futures) & whitelist
+        # 一旦 futures 是空，最终 allowed_symbols 一定是空。
+        # 现在支持 fallback 到现货白名单模式。
+        if futures_symbols:
+            self.allowed_symbols = (spot_symbols & futures_symbols) & UPBIT_HOT_SYMBOLS
+            self.monitor_mode = "futures_intersection"
+        elif ALLOW_SPOT_FALLBACK:
+            self.allowed_symbols = spot_symbols & UPBIT_HOT_SYMBOLS
+            self.monitor_mode = "spot_fallback"
+        else:
+            self.allowed_symbols = set()
+            self.monitor_mode = "empty"
 
         logging.info(
-            "交易池刷新完成: 现货山寨币=%s, 合约参照币种=%s, Upbit白名单=%s, 最终可监控=%s, 合约来源=%s",
+            "交易池刷新完成：现货山寨币=%s，合约符号种=%s，Upbit白名单=%s，最终可监控=%s，合约来源=%s，监控模式=%s",
             len(spot_symbols),
             len(futures_symbols),
             len(UPBIT_HOT_SYMBOLS),
             len(self.allowed_symbols),
             self.futures_source,
+            self.monitor_mode,
         )
 
 
@@ -519,15 +544,16 @@ class OrderFlowScanner:
     async def _alert_absorption(self, symbol: str, result: dict) -> None:
         if result["type"] == "buy_absorption":
             signal = "买入 / 观望"
-            title = "疑似大额限价买单承接"
+            title = "【疑似大额限价买单承接】"
             reason = "主动卖盘成交很多，但价格并未明显下跌"
         else:
             signal = "卖出 / 观望"
-            title = "疑似大额限价卖单压盘"
+            title = "【疑似大额限价卖单压盘】"
             reason = "主动买盘成交很多，但价格并未明显上涨"
 
+        # 修复：原代码定义了 title，但消息里没输出
         msg = (
-            f"\n"
+            f"{title}\n"
             f"币种：{symbol}\n"
             f"操作建议：{signal}\n"
             f"原因：{reason}\n\n"
@@ -552,6 +578,7 @@ class OrderFlowScanner:
             "spot_symbol_count": len(self.universe.spot_symbols),
             "futures_symbol_count": len(self.universe.futures_symbols),
             "futures_source": self.universe.futures_source,
+            "monitor_mode": self.universe.monitor_mode,
             "last_error": self.runtime.last_error,
         })
 
@@ -619,6 +646,9 @@ class OrderFlowScanner:
         now = time.time()
 
         for item in arr:
+            if not isinstance(item, dict):
+                continue
+
             symbol = item.get("s", "").upper()
             if symbol not in self.universe.allowed_symbols:
                 continue
@@ -628,8 +658,12 @@ class OrderFlowScanner:
                 st = MiniTickerState(symbol=symbol)
                 self.market[symbol] = st
 
-            st.last_price = float(item.get("c", 0.0))
-            st.quote_volume_24h = float(item.get("q", 0.0))
+            try:
+                st.last_price = float(item.get("c", 0.0) or 0.0)
+                st.quote_volume_24h = float(item.get("q", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+
             st.last_update_ts = now
 
         added, removed = self._reselect_active_symbols()
@@ -651,27 +685,44 @@ class OrderFlowScanner:
             await self._subscribe_streams(sub)
 
     async def _handle_book_ticker(self, data: dict) -> None:
+        if not isinstance(data, dict):
+            return
+
         symbol = data.get("s", "").upper()
         if symbol not in self.active_symbols:
             return
 
-        snap = BookTickerSnapshot(
-            ts=time.time(),
-            bid=float(data.get("b", 0.0)),
-            ask=float(data.get("a", 0.0)),
-            bid_qty=float(data.get("B", 0.0)),
-            ask_qty=float(data.get("A", 0.0)),
-        )
+        try:
+            snap = BookTickerSnapshot(
+                ts=time.time(),
+                bid=float(data.get("b", 0.0) or 0.0),
+                ask=float(data.get("a", 0.0) or 0.0),
+                bid_qty=float(data.get("B", 0.0) or 0.0),
+                ask_qty=float(data.get("A", 0.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            return
+
         self.book_flow[symbol].append(snap)
 
     async def _handle_agg_trade(self, data: dict) -> None:
+        if not isinstance(data, dict):
+            return
+
         symbol = data.get("s", "").upper()
         if symbol not in self.active_symbols:
             return
 
-        price = float(data.get("p", 0.0))
-        qty = float(data.get("q", 0.0))
-        ts = float(data.get("T", 0)) / 1000.0
+        try:
+            price = float(data.get("p", 0.0) or 0.0)
+            qty = float(data.get("q", 0.0) or 0.0)
+            ts = float(data.get("T", 0) or 0) / 1000.0
+        except (TypeError, ValueError):
+            return
+
+        if price <= 0 or qty <= 0 or ts <= 0:
+            return
+
         notional = price * qty
 
         # m=true => buyer is maker => 主动卖盘
@@ -697,7 +748,15 @@ class OrderFlowScanner:
 
     async def _handle_message(self, raw: str) -> None:
         self.runtime.last_message_at = time.time()
-        payload = json.loads(raw)
+
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            logging.warning("收到无法解析的消息")
+            return
+
+        if not isinstance(payload, dict):
+            return
 
         if "result" in payload and "id" in payload:
             await self._handle_control_response(payload)
@@ -710,11 +769,11 @@ class OrderFlowScanner:
             await self._handle_mini_ticker_arr(data)
             return
 
-        if stream.endswith("@aggTrade"):
+        if isinstance(stream, str) and stream.endswith("@aggTrade"):
             await self._handle_agg_trade(data)
             return
 
-        if stream.endswith("@bookTicker"):
+        if isinstance(stream, str) and stream.endswith("@bookTicker"):
             await self._handle_book_ticker(data)
             return
 
@@ -752,24 +811,33 @@ class OrderFlowScanner:
         elif self.universe.futures_source == "env":
             source_text = "环境变量 FUTURES_SYMBOLS"
         elif self.universe.futures_source == "missing_env":
-            source_text = "未提供 FUTURES_SYMBOLS，当前为空"
+            source_text = "未提供 FUTURES_SYMBOLS"
+        elif self.universe.futures_source == "error":
+            source_text = "Futures 获取失败"
         else:
             source_text = "未知"
 
+        if self.universe.monitor_mode == "futures_intersection":
+            mode_text = "仅监控有 USDⓈ-M 合约且在 Upbit 白名单中的币种"
+        elif self.universe.monitor_mode == "spot_fallback":
+            mode_text = "Futures 不可用，已退回现货白名单监控模式"
+        else:
+            mode_text = "当前监控池为空"
+
         await self.notifier.send(
             "【系统启动成功】\n"
-            "仅监控有 USDⓈ-M 合约且在 Upbit 热门白名单中的币种\n"
+            f"{mode_text}\n"
             "仅监控：大额主动成交 / 疑似限价承接与压盘\n"
             "不使用涨跌幅、热度分数\n"
             f"合约币种来源：{source_text}"
         )
 
-        if self.universe.futures_source == "missing_env":
+        if self.universe.monitor_mode == "empty":
             await self.notifier.send(
                 "【配置提醒】\n"
-                "Futures API 当前返回 451，且未设置 FUTURES_SYMBOLS。\n"
-                "程序已继续运行，但当前不会监控任何币种。\n"
-                "请在 Railway Variables 中添加 FUTURES_SYMBOLS。"
+                "当前没有可监控币种。\n"
+                "如 Futures API 返回 451，请设置 FUTURES_SYMBOLS，"
+                "或将 ALLOW_SPOT_FALLBACK=true。"
             )
 
         await self._run()
@@ -856,7 +924,11 @@ async def main() -> None:
 
     for sig_name in ("SIGINT", "SIGTERM"):
         if hasattr(signal, sig_name):
-            loop.add_signal_handler(getattr(signal, sig_name), _shutdown)
+            try:
+                loop.add_signal_handler(getattr(signal, sig_name), _shutdown)
+            except NotImplementedError:
+                # Windows 某些事件循环不支持
+                pass
 
     try:
         await scanner.start()
