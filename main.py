@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import math
 import os
 import signal
 import time
@@ -26,23 +25,18 @@ FUTURES_REST_BASE = os.getenv("FUTURES_REST_BASE", "https://fapi.binance.com").r
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PORT = int(os.getenv("PORT", "8080"))
 ENABLE_HEALTHCHECK = os.getenv("ENABLE_HEALTHCHECK", "true").lower() == "true"
-
 RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "5"))
 
-# Telegram
 TELEGRAM_BOT_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
-TELEGRAM_CHAT_ID = "6308781694"
+TELEGRAM_CHAT_ID =  "6308781694"
 
-# 市场扫描
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT").upper()
 DISCOVERY_STREAM = "!miniTicker@arr"
-UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC", "1800"))
-HOT_REBALANCE_SEC = int(os.getenv("HOT_REBALANCE_SEC", "45"))
-TOP_N_HOT = int(os.getenv("TOP_N_HOT", "40"))
-MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "500000"))
-MIN_PRICE = float(os.getenv("MIN_PRICE", "0.0000001"))
 
-# 主流币过滤
+UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC", "1800"))
+TOP_N_SUBSCRIBE = int(os.getenv("TOP_N_SUBSCRIBE", "80"))
+MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "1000000"))
+
 EXCLUDED_BASE_ASSETS: Set[str] = {
     x.strip().upper()
     for x in os.getenv(
@@ -61,39 +55,25 @@ EXCLUDED_SYMBOLS: Set[str] = {
     if x.strip()
 }
 
-# 热点与动量
-ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "300"))
-HOT_ALERT_THRESHOLD = float(os.getenv("HOT_ALERT_THRESHOLD", "65"))
-MOMENTUM_WINDOW_SEC = int(os.getenv("MOMENTUM_WINDOW_SEC", "180"))
-MOMENTUM_ALERT_PCT = float(os.getenv("MOMENTUM_ALERT_PCT", "5.0"))
+ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "180"))
 
-BUY_SCORE_THRESHOLD = float(os.getenv("BUY_SCORE_THRESHOLD", "75"))
-BUY_MOMENTUM_THRESHOLD = float(os.getenv("BUY_MOMENTUM_THRESHOLD", "3.0"))
-WEAK_BUY_SCORE_THRESHOLD = float(os.getenv("WEAK_BUY_SCORE_THRESHOLD", "60"))
-WEAK_BUY_MOMENTUM_THRESHOLD = float(os.getenv("WEAK_BUY_MOMENTUM_THRESHOLD", "1.5"))
-SELL_MOMENTUM_THRESHOLD = float(os.getenv("SELL_MOMENTUM_THRESHOLD", "-3.0"))
-BUY_MAX_SPREAD_PCT = float(os.getenv("BUY_MAX_SPREAD_PCT", "0.5"))
+# 大额主动成交
+AGGRESSIVE_LARGE_NOTIONAL = float(os.getenv("AGGRESSIVE_LARGE_NOTIONAL", "80000"))
+AGGRESSIVE_CLUSTER_WINDOW_SEC = float(os.getenv("AGGRESSIVE_CLUSTER_WINDOW_SEC", "2.0"))
+AGGRESSIVE_CLUSTER_MIN_NOTIONAL = float(os.getenv("AGGRESSIVE_CLUSTER_MIN_NOTIONAL", "180000"))
+AGGRESSIVE_MIN_SIDE_DOMINANCE = float(os.getenv("AGGRESSIVE_MIN_SIDE_DOMINANCE", "0.75"))
+AGGRESSIVE_MIN_TRADE_COUNT = int(os.getenv("AGGRESSIVE_MIN_TRADE_COUNT", "2"))
 
-# 大单 / 订单流
-LARGE_TRADE_MIN_NOTIONAL = float(os.getenv("LARGE_TRADE_MIN_NOTIONAL", "50000"))
-LARGE_TRADE_CLUSTER_WINDOW_SEC = float(os.getenv("LARGE_TRADE_CLUSTER_WINDOW_SEC", "2.0"))
-LARGE_TRADE_CLUSTER_MIN_NOTIONAL = float(os.getenv("LARGE_TRADE_CLUSTER_MIN_NOTIONAL", "150000"))
-LARGE_TRADE_FOLLOWTHROUGH_PCT = float(os.getenv("LARGE_TRADE_FOLLOWTHROUGH_PCT", "0.35"))
-LARGE_TRADE_MAX_MICRO_NOTIONAL = float(os.getenv("LARGE_TRADE_MAX_MICRO_NOTIONAL", "3000"))
-LARGE_TRADE_MIN_SIDE_DOMINANCE = float(os.getenv("LARGE_TRADE_MIN_SIDE_DOMINANCE", "0.7"))
-LARGE_TRADE_MIN_CLUSTER_COUNT = int(os.getenv("LARGE_TRADE_MIN_CLUSTER_COUNT", "2"))
-ORDER_FLOW_WINDOW_SEC = int(os.getenv("ORDER_FLOW_WINDOW_SEC", "12"))
-
-# 确认机制
-CONFIRMATION_DELAY_SEC = float(os.getenv("CONFIRMATION_DELAY_SEC", "5"))
-CONFIRMATION_PRICE_MOVE_PCT = float(os.getenv("CONFIRMATION_PRICE_MOVE_PCT", "0.25"))
-CVD_IMBALANCE_THRESHOLD = float(os.getenv("CVD_IMBALANCE_THRESHOLD", "0.65"))
-BREAKOUT_LOOKBACK_SEC = int(os.getenv("BREAKOUT_LOOKBACK_SEC", "60"))
-BREAKOUT_BUFFER_PCT = float(os.getenv("BREAKOUT_BUFFER_PCT", "0.10"))
+# 限价承接 / 压盘 近似识别
+ABSORPTION_WINDOW_SEC = float(os.getenv("ABSORPTION_WINDOW_SEC", "3.0"))
+ABSORPTION_MIN_NOTIONAL = float(os.getenv("ABSORPTION_MIN_NOTIONAL", "150000"))
+ABSORPTION_MAX_PRICE_MOVE_PCT = float(os.getenv("ABSORPTION_MAX_PRICE_MOVE_PCT", "0.12"))
+ABSORPTION_MIN_BOOK_UPDATES = int(os.getenv("ABSORPTION_MIN_BOOK_UPDATES", "3"))
 
 # 机器人噪音过滤
-BOT_MAX_ALTERNATING_TRADES = int(os.getenv("BOT_MAX_ALTERNATING_TRADES", "8"))
-BOT_MICRO_BURST_WINDOW_SEC = float(os.getenv("BOT_MICRO_BURST_WINDOW_SEC", "2.0"))
+BOT_MAX_MICRO_NOTIONAL = float(os.getenv("BOT_MAX_MICRO_NOTIONAL", "3000"))
+BOT_ALTERNATING_COUNT = int(os.getenv("BOT_ALTERNATING_COUNT", "8"))
+BOT_BURST_WINDOW_SEC = float(os.getenv("BOT_BURST_WINDOW_SEC", "2.0"))
 
 
 # =========================================================
@@ -104,22 +84,17 @@ BOT_MICRO_BURST_WINDOW_SEC = float(os.getenv("BOT_MICRO_BURST_WINDOW_SEC", "2.0"
 class MiniTickerState:
     symbol: str
     last_price: float = 0.0
-    open_24h: float = 0.0
-    high_24h: float = 0.0
-    low_24h: float = 0.0
-    base_volume_24h: float = 0.0
     quote_volume_24h: float = 0.0
     last_update_ts: float = 0.0
-    recent_prices: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=1200))
-    hot_score: float = 0.0
-    is_hot: bool = False
 
 
 @dataclass
-class BookTickerState:
-    bid: Optional[float] = None
-    ask: Optional[float] = None
-    last_update_ts: float = 0.0
+class BookTickerSnapshot:
+    ts: float
+    bid: float
+    ask: float
+    bid_qty: float
+    ask_qty: float
 
 
 @dataclass
@@ -128,23 +103,7 @@ class AggTradeEvent:
     price: float
     qty: float
     notional: float
-    side: str  # "buy" / "sell"
-
-
-@dataclass
-class PendingFlowSignal:
-    symbol: str
-    side: str
-    created_at: float
-    start_price: float
-    end_price: float
-    dominant_notional: float
-    total_notional: float
-    side_ratio: float
-    trade_count: int
-    max_trade_notional: float
-    imbalance_ratio: float
-    breakout_ok: bool
+    side: str  # buy / sell
 
 
 @dataclass
@@ -155,7 +114,7 @@ class RuntimeStatus:
     last_message_at: Optional[float] = None
     reconnect_count: int = 0
     universe_size: int = 0
-    hot_pool_size: int = 0
+    subscribed_count: int = 0
     last_error: str = ""
 
 
@@ -203,7 +162,7 @@ class TelegramNotifier:
 
 
 # =========================================================
-# 交易对扫描
+# Universe
 # =========================================================
 
 class BinanceUniverse:
@@ -212,8 +171,8 @@ class BinanceUniverse:
         self.futures_rest_base = futures_rest_base
         self.session: Optional[aiohttp.ClientSession] = None
         self.allowed_symbols: Set[str] = set()
-        self.futures_symbols: Set[str] = set()
         self.spot_symbols: Set[str] = set()
+        self.futures_symbols: Set[str] = set()
 
     async def start(self) -> None:
         if self.session is None:
@@ -235,7 +194,6 @@ class BinanceUniverse:
             data = await resp.json()
 
         allowed: Set[str] = set()
-
         for item in data.get("symbols", []):
             symbol = item.get("symbol", "").upper()
             status = item.get("status", "")
@@ -255,7 +213,6 @@ class BinanceUniverse:
                 continue
 
             allowed.add(symbol)
-
         return allowed
 
     async def _fetch_usdm_futures_symbols(self) -> Set[str]:
@@ -268,7 +225,6 @@ class BinanceUniverse:
             data = await resp.json()
 
         futures_symbols: Set[str] = set()
-
         for item in data.get("symbols", []):
             symbol = item.get("symbol", "").upper()
             status = item.get("status", "")
@@ -305,262 +261,29 @@ class BinanceUniverse:
 
 
 # =========================================================
-# 主扫描器
+# Scanner
 # =========================================================
 
-class AltcoinScanner:
+class OrderFlowScanner:
     def __init__(self):
         self.runtime = RuntimeStatus()
         self.universe = BinanceUniverse(REST_BASE, FUTURES_REST_BASE)
         self.notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
         self.market: Dict[str, MiniTickerState] = {}
-        self.book: Dict[str, BookTickerState] = defaultdict(BookTickerState)
-        self.trade_flow: Dict[str, Deque[AggTradeEvent]] = defaultdict(lambda: deque(maxlen=3000))
+        self.trade_flow: Dict[str, Deque[AggTradeEvent]] = defaultdict(lambda: deque(maxlen=4000))
+        self.book_flow: Dict[str, Deque[BookTickerSnapshot]] = defaultdict(lambda: deque(maxlen=400))
 
-        self.hot_symbols: Set[str] = set()
+        self.active_symbols: Set[str] = set()
         self.last_alert_at: Dict[str, float] = defaultdict(float)
-        self.pending_confirmations: Dict[str, PendingFlowSignal] = {}
-        self.confirmation_tasks: Dict[str, asyncio.Task] = {}
 
         self.ws = None
+        self.health_runner: Optional[web.AppRunner] = None
         self._stop_event = asyncio.Event()
         self._last_universe_refresh = 0.0
-        self._last_hot_rebalance = 0.0
-        self.health_runner: Optional[web.AppRunner] = None
 
     def stop(self) -> None:
         self._stop_event.set()
-
-    @staticmethod
-    def _pct_change(start_price: float, end_price: float) -> float:
-        if start_price <= 0:
-            return 0.0
-        return (end_price - start_price) / start_price * 100.0
-
-    def _recent_momentum_pct(self, state: MiniTickerState, now: float) -> float:
-        if not state.recent_prices:
-            return 0.0
-
-        cutoff = now - MOMENTUM_WINDOW_SEC
-        while state.recent_prices and state.recent_prices[0][0] < cutoff:
-            state.recent_prices.popleft()
-
-        if len(state.recent_prices) < 2:
-            return 0.0
-
-        first_price = state.recent_prices[0][1]
-        last_price = state.recent_prices[-1][1]
-        return self._pct_change(first_price, last_price)
-
-    def _get_spread_pct(self, symbol: str) -> float:
-        bid = self.book[symbol].bid
-        ask = self.book[symbol].ask
-        if not bid or not ask or bid <= 0 or ask <= 0:
-            return 0.0
-        mid = (bid + ask) / 2.0
-        if mid <= 0:
-            return 0.0
-        return (ask - bid) / mid * 100.0
-
-    def _get_breakout_info(self, symbol: str) -> Tuple[bool, str]:
-        state = self.market.get(symbol)
-        if not state or len(state.recent_prices) < 3:
-            return False, "缺少突破参考数据"
-
-        now = time.time()
-        cutoff = now - BREAKOUT_LOOKBACK_SEC
-        prices = [p for ts, p in state.recent_prices if ts >= cutoff]
-        if len(prices) < 3:
-            return False, "近1分钟价格样本不足"
-
-        current = prices[-1]
-        prev_high = max(prices[:-1])
-        prev_low = min(prices[:-1])
-
-        up_break = current >= prev_high * (1 + BREAKOUT_BUFFER_PCT / 100.0)
-        down_break = current <= prev_low * (1 - BREAKOUT_BUFFER_PCT / 100.0)
-
-        if up_break:
-            return True, f"突破近{BREAKOUT_LOOKBACK_SEC}秒高点"
-        if down_break:
-            return True, f"跌破近{BREAKOUT_LOOKBACK_SEC}秒低点"
-        return False, "未形成有效突破"
-
-    def _order_flow_imbalance(self, symbol: str) -> float:
-        now = time.time()
-        flow = self.trade_flow[symbol]
-        cutoff = now - ORDER_FLOW_WINDOW_SEC
-        while flow and flow[0].ts < cutoff:
-            flow.popleft()
-
-        buy_notional = sum(e.notional for e in flow if e.side == "buy")
-        sell_notional = sum(e.notional for e in flow if e.side == "sell")
-        total = buy_notional + sell_notional
-        if total <= 0:
-            return 0.0
-
-        return (buy_notional - sell_notional) / total
-
-    def _score_symbol(self, state: MiniTickerState, now: float) -> float:
-        if state.open_24h <= 0 or state.last_price <= 0:
-            return 0.0
-
-        pct_24h = self._pct_change(state.open_24h, state.last_price)
-        momentum = self._recent_momentum_pct(state, now)
-        quote_volume = state.quote_volume_24h
-
-        if quote_volume < MIN_24H_QUOTE_VOLUME:
-            return 0.0
-        if state.last_price < MIN_PRICE:
-            return 0.0
-
-        volume_score = min(30.0, max(0.0, math.log10(max(quote_volume, 1.0)) * 4.0))
-        pct_score = max(0.0, min(35.0, pct_24h * 1.2))
-        momentum_score = max(0.0, min(35.0, momentum * 4.0))
-        return round(volume_score + pct_score + momentum_score, 2)
-
-    def _rebalance_hot_pool(self) -> Tuple[Set[str], Set[str]]:
-        now = time.time()
-        candidates: List[MiniTickerState] = []
-
-        for symbol, state in self.market.items():
-            if symbol not in self.universe.allowed_symbols:
-                continue
-            state.hot_score = self._score_symbol(state, now)
-            if state.hot_score > 0:
-                candidates.append(state)
-
-        candidates.sort(key=lambda x: x.hot_score, reverse=True)
-        next_hot = {x.symbol for x in candidates[:TOP_N_HOT]}
-
-        added = next_hot - self.hot_symbols
-        removed = self.hot_symbols - next_hot
-
-        for symbol, state in self.market.items():
-            state.is_hot = symbol in next_hot
-
-        self.hot_symbols = next_hot
-        self.runtime.hot_pool_size = len(self.hot_symbols)
-        return added, removed
-
-    def _get_trade_signal(self, symbol: str) -> Tuple[str, str]:
-        state = self.market.get(symbol)
-        if not state:
-            return "观望", "缺少市场数据"
-
-        momentum = self._recent_momentum_pct(state, time.time())
-        pct_24h = self._pct_change(state.open_24h, state.last_price)
-        spread_pct = self._get_spread_pct(symbol)
-        imbalance = self._order_flow_imbalance(symbol)
-
-        if (
-            state.hot_score >= BUY_SCORE_THRESHOLD
-            and momentum >= BUY_MOMENTUM_THRESHOLD
-            and spread_pct <= BUY_MAX_SPREAD_PCT
-            and imbalance >= CVD_IMBALANCE_THRESHOLD
-        ):
-            return "买入", (
-                f"热度高（{state.hot_score}），短线动量强（{momentum:.2f}%），"
-                f"主动买盘占优（{imbalance:.2f}），价差正常（{spread_pct:.3f}%）"
-            )
-
-        if momentum <= SELL_MOMENTUM_THRESHOLD and imbalance <= -CVD_IMBALANCE_THRESHOLD:
-            return "卖出", f"短线动量转弱（{momentum:.2f}%），主动卖盘占优（{imbalance:.2f}）"
-
-        if state.hot_score >= WEAK_BUY_SCORE_THRESHOLD and momentum >= WEAK_BUY_MOMENTUM_THRESHOLD and pct_24h > 0:
-            return "买入", f"热度偏强（{state.hot_score}），短线继续上行（{momentum:.2f}%）"
-
-        return "观望", f"当前信号不够一致：热度={state.hot_score}，动量={momentum:.2f}%，失衡={imbalance:.2f}"
-
-    def _recent_flow_window(self, symbol: str, now: float) -> List[AggTradeEvent]:
-        flow = self.trade_flow[symbol]
-        cutoff = now - ORDER_FLOW_WINDOW_SEC
-        while flow and flow[0].ts < cutoff:
-            flow.popleft()
-        return list(flow)
-
-    def _is_bot_noise(self, events: List[AggTradeEvent]) -> bool:
-        if len(events) < BOT_MAX_ALTERNATING_TRADES:
-            return False
-
-        recent = [e for e in events if e.notional <= LARGE_TRADE_MAX_MICRO_NOTIONAL]
-        if len(recent) < BOT_MAX_ALTERNATING_TRADES:
-            return False
-
-        last_n = recent[-BOT_MAX_ALTERNATING_TRADES:]
-        sides = [e.side for e in last_n]
-        alternating = sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1])
-        time_span = last_n[-1].ts - last_n[0].ts
-
-        return alternating >= BOT_MAX_ALTERNATING_TRADES - 1 and time_span <= BOT_MICRO_BURST_WINDOW_SEC
-
-    def _detect_large_order_flow(self, symbol: str) -> Optional[dict]:
-        now = time.time()
-        events = self._recent_flow_window(symbol, now)
-        if len(events) < LARGE_TRADE_MIN_CLUSTER_COUNT:
-            return None
-
-        if self._is_bot_noise(events):
-            return None
-
-        cluster_cutoff = now - LARGE_TRADE_CLUSTER_WINDOW_SEC
-        cluster = [e for e in events if e.ts >= cluster_cutoff]
-        if len(cluster) < LARGE_TRADE_MIN_CLUSTER_COUNT:
-            return None
-
-        cluster = [e for e in cluster if e.notional >= LARGE_TRADE_MAX_MICRO_NOTIONAL]
-        if len(cluster) < LARGE_TRADE_MIN_CLUSTER_COUNT:
-            return None
-
-        buy_notional = sum(e.notional for e in cluster if e.side == "buy")
-        sell_notional = sum(e.notional for e in cluster if e.side == "sell")
-        total_notional = buy_notional + sell_notional
-        if total_notional < LARGE_TRADE_CLUSTER_MIN_NOTIONAL:
-            return None
-
-        dominant_side = "buy" if buy_notional >= sell_notional else "sell"
-        dominant_notional = max(buy_notional, sell_notional)
-        side_ratio = dominant_notional / total_notional if total_notional > 0 else 0.0
-        if side_ratio < LARGE_TRADE_MIN_SIDE_DOMINANCE:
-            return None
-
-        max_trade_notional = max(e.notional for e in cluster)
-        if max_trade_notional < LARGE_TRADE_MIN_NOTIONAL:
-            return None
-
-        start_price = cluster[0].price
-        end_price = cluster[-1].price
-        price_move_pct = self._pct_change(start_price, end_price)
-
-        if dominant_side == "buy" and price_move_pct < LARGE_TRADE_FOLLOWTHROUGH_PCT:
-            return None
-        if dominant_side == "sell" and price_move_pct > -LARGE_TRADE_FOLLOWTHROUGH_PCT:
-            return None
-
-        imbalance = self._order_flow_imbalance(symbol)
-        if dominant_side == "buy" and imbalance < CVD_IMBALANCE_THRESHOLD:
-            return None
-        if dominant_side == "sell" and imbalance > -CVD_IMBALANCE_THRESHOLD:
-            return None
-
-        breakout_ok, breakout_reason = self._get_breakout_info(symbol)
-        if not breakout_ok:
-            return None
-
-        return {
-            "side": dominant_side,
-            "total_notional": total_notional,
-            "dominant_notional": dominant_notional,
-            "side_ratio": side_ratio,
-            "price_move_pct": price_move_pct,
-            "trade_count": len(cluster),
-            "max_trade_notional": max_trade_notional,
-            "start_price": start_price,
-            "end_price": end_price,
-            "imbalance_ratio": imbalance,
-            "breakout_reason": breakout_reason,
-        }
 
     async def _maybe_alert(self, key: str, text: str) -> None:
         now = time.time()
@@ -570,102 +293,167 @@ class AltcoinScanner:
         logging.warning(text.replace("\n", " | "))
         await self.notifier.send(text)
 
-    async def _alert_hot_entry(self, symbol: str) -> None:
-        state = self.market.get(symbol)
-        if not state or state.hot_score < HOT_ALERT_THRESHOLD:
-            return
+    def _is_bot_noise(self, events: List[AggTradeEvent]) -> bool:
+        micro = [e for e in events if e.notional <= BOT_MAX_MICRO_NOTIONAL]
+        if len(micro) < BOT_ALTERNATING_COUNT:
+            return False
 
-        pct_24h = self._pct_change(state.open_24h, state.last_price)
-        momentum = self._recent_momentum_pct(state, time.time())
-        signal_text, signal_reason = self._get_trade_signal(symbol)
+        recent = micro[-BOT_ALTERNATING_COUNT:]
+        sides = [e.side for e in recent]
+        alternating = sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1])
+        span = recent[-1].ts - recent[0].ts
+
+        return alternating >= BOT_ALTERNATING_COUNT - 1 and span <= BOT_BURST_WINDOW_SEC
+
+    def _get_trade_window(self, symbol: str, sec: float) -> List[AggTradeEvent]:
+        now = time.time()
+        dq = self.trade_flow[symbol]
+        cutoff = now - max(sec, 10.0)
+        while dq and dq[0].ts < cutoff:
+            dq.popleft()
+        return [x for x in dq if x.ts >= now - sec]
+
+    def _get_book_window(self, symbol: str, sec: float) -> List[BookTickerSnapshot]:
+        now = time.time()
+        dq = self.book_flow[symbol]
+        cutoff = now - max(sec, 10.0)
+        while dq and dq[0].ts < cutoff:
+            dq.popleft()
+        return [x for x in dq if x.ts >= now - sec]
+
+    @staticmethod
+    def _pct_change(a: float, b: float) -> float:
+        if a <= 0:
+            return 0.0
+        return (b - a) / a * 100.0
+
+    def _detect_aggressive_flow(self, symbol: str) -> Optional[dict]:
+        events = self._get_trade_window(symbol, AGGRESSIVE_CLUSTER_WINDOW_SEC)
+        if len(events) < AGGRESSIVE_MIN_TRADE_COUNT:
+            return None
+
+        if self._is_bot_noise(events):
+            return None
+
+        buy_notional = sum(e.notional for e in events if e.side == "buy")
+        sell_notional = sum(e.notional for e in events if e.side == "sell")
+        total_notional = buy_notional + sell_notional
+        if total_notional < AGGRESSIVE_CLUSTER_MIN_NOTIONAL:
+            return None
+
+        dominant_side = "buy" if buy_notional >= sell_notional else "sell"
+        dominant_notional = max(buy_notional, sell_notional)
+        side_ratio = dominant_notional / total_notional if total_notional > 0 else 0.0
+        if side_ratio < AGGRESSIVE_MIN_SIDE_DOMINANCE:
+            return None
+
+        max_single = max(e.notional for e in events)
+        if max_single < AGGRESSIVE_LARGE_NOTIONAL:
+            return None
+
+        start_price = events[0].price
+        end_price = events[-1].price
+        move_pct = self._pct_change(start_price, end_price)
+
+        return {
+            "side": dominant_side,
+            "total_notional": total_notional,
+            "dominant_notional": dominant_notional,
+            "side_ratio": side_ratio,
+            "max_single": max_single,
+            "trade_count": len(events),
+            "start_price": start_price,
+            "end_price": end_price,
+            "move_pct": move_pct,
+        }
+
+    def _detect_absorption(self, symbol: str) -> Optional[dict]:
+        trades = self._get_trade_window(symbol, ABSORPTION_WINDOW_SEC)
+        books = self._get_book_window(symbol, ABSORPTION_WINDOW_SEC)
+
+        if len(trades) < 2 or len(books) < ABSORPTION_MIN_BOOK_UPDATES:
+            return None
+
+        if self._is_bot_noise(trades):
+            return None
+
+        buy_notional = sum(e.notional for e in trades if e.side == "buy")
+        sell_notional = sum(e.notional for e in trades if e.side == "sell")
+
+        first_trade_price = trades[0].price
+        last_trade_price = trades[-1].price
+        move_pct = self._pct_change(first_trade_price, last_trade_price)
+
+        # 疑似大限价买单承接：
+        # 主动卖盘很多，但价格没怎么跌
+        if sell_notional >= ABSORPTION_MIN_NOTIONAL and abs(move_pct) <= ABSORPTION_MAX_PRICE_MOVE_PCT and move_pct > -ABSORPTION_MAX_PRICE_MOVE_PCT:
+            return {
+                "type": "buy_absorption",
+                "notional": sell_notional,
+                "move_pct": move_pct,
+                "start_price": first_trade_price,
+                "end_price": last_trade_price,
+                "book_updates": len(books),
+            }
+
+        # 疑似大限价卖单压盘：
+        # 主动买盘很多，但价格没怎么涨
+        if buy_notional >= ABSORPTION_MIN_NOTIONAL and abs(move_pct) <= ABSORPTION_MAX_PRICE_MOVE_PCT and move_pct < ABSORPTION_MAX_PRICE_MOVE_PCT:
+            return {
+                "type": "sell_absorption",
+                "notional": buy_notional,
+                "move_pct": move_pct,
+                "start_price": first_trade_price,
+                "end_price": last_trade_price,
+                "book_updates": len(books),
+            }
+
+        return None
+
+    async def _alert_aggressive_flow(self, symbol: str, result: dict) -> None:
+        side = result["side"]
+        signal = "买入" if side == "buy" else "卖出"
+        direction = "主动买入" if side == "buy" else "主动卖出"
 
         msg = (
-            f"【热点币预警】\n"
+            f"【大额主动成交预警】\n"
             f"币种：{symbol}\n"
-            f"操作建议：{signal_text}\n"
-            f"原因：{signal_reason}\n\n"
-            f"热度分数：{state.hot_score}\n"
-            f"24小时涨幅：{pct_24h:.2f}%\n"
-            f"24小时成交额：{state.quote_volume_24h:,.0f} {QUOTE_ASSET}\n"
-            f"{MOMENTUM_WINDOW_SEC // 60}分钟动量：{momentum:.2f}%\n"
-            f"最新价格：{state.last_price}"
+            f"操作建议：{signal}\n"
+            f"成交类型：{direction}\n\n"
+            f"聚合成交额：{result['total_notional']:,.0f} {QUOTE_ASSET}\n"
+            f"主导成交占比：{result['side_ratio'] * 100:.1f}%\n"
+            f"最大单笔成交额：{result['max_single']:,.0f} {QUOTE_ASSET}\n"
+            f"成交笔数：{result['trade_count']}\n"
+            f"价格变化：{result['move_pct']:.2f}%\n"
+            f"价格区间：{result['start_price']} -> {result['end_price']}"
         )
-        await self._maybe_alert(f"hot:{symbol}", msg)
+        await self._maybe_alert(f"aggressive:{symbol}:{side}", msg)
 
-    async def _alert_momentum(self, symbol: str) -> None:
-        state = self.market.get(symbol)
-        if not state or not state.is_hot:
-            return
-
-        momentum = self._recent_momentum_pct(state, time.time())
-        if abs(momentum) < MOMENTUM_ALERT_PCT:
-            return
-
-        direction = "快速拉升" if momentum > 0 else "快速回落"
-        signal_text, signal_reason = self._get_trade_signal(symbol)
+    async def _alert_absorption(self, symbol: str, result: dict) -> None:
+        if result["type"] == "buy_absorption":
+            signal = "买入 / 观望"
+            title = "疑似大额限价买单承接"
+            reason = "主动卖盘成交很多，但价格并未明显下跌"
+        else:
+            signal = "卖出 / 观望"
+            title = "疑似大额限价卖单压盘"
+            reason = "主动买盘成交很多，但价格并未明显上涨"
 
         msg = (
-            f"【短线异动预警】\n"
+            f"\n"
             f"币种：{symbol}\n"
-            f"异动方向：{direction}\n"
-            f"操作建议：{signal_text}\n"
-            f"原因：{signal_reason}\n\n"
-            f"{MOMENTUM_WINDOW_SEC // 60}分钟涨跌幅：{momentum:.2f}%\n"
-            f"订单流失衡：{self._order_flow_imbalance(symbol):.2f}\n"
-            f"热度分数：{state.hot_score}\n"
-            f"最新价格：{state.last_price}"
+            f"操作建议：{signal}\n"
+            f"原因：{reason}\n\n"
+            f"成交额：{result['notional']:,.0f} {QUOTE_ASSET}\n"
+            f"价格变化：{result['move_pct']:.3f}%\n"
+            f"价格区间：{result['start_price']} -> {result['end_price']}\n"
+            f"盘口更新次数：{result['book_updates']}"
         )
-        await self._maybe_alert(f"mom:{symbol}", msg)
-
-    async def _alert_large_order_flow_confirmed(self, signal: PendingFlowSignal, confirmed_move_pct: float) -> None:
-        signal_text = "买入" if signal.side == "buy" else "卖出"
-        direction = "上涨" if signal.side == "buy" else "下跌"
-
-        msg = (
-            f"【大单推动确认预警】\n"
-            f"币种：{signal.symbol}\n"
-            f"操作建议：{signal_text}\n"
-            f"原因：大单簇出现后价格继续{direction}\n\n"
-            f"主导方向：{'主动买盘' if signal.side == 'buy' else '主动卖盘'}\n"
-            f"聚合成交额：{signal.total_notional:,.0f} {QUOTE_ASSET}\n"
-            f"主导成交额占比：{signal.side_ratio * 100:.1f}%\n"
-            f"最大单笔成交额：{signal.max_trade_notional:,.0f} {QUOTE_ASSET}\n"
-            f"成交笔数：{signal.trade_count}\n"
-            f"订单流失衡：{signal.imbalance_ratio:.2f}\n"
-            f"突破状态：{'是' if signal.breakout_ok else '否'}\n"
-            f"初始推动价格：{signal.start_price} -> {signal.end_price}\n"
-            f"{CONFIRMATION_DELAY_SEC:.0f}秒后延续幅度：{confirmed_move_pct:.2f}%"
-        )
-        await self._maybe_alert(f"flow_confirmed:{signal.symbol}:{signal.side}", msg)
-
-    async def _schedule_confirmation(self, signal: PendingFlowSignal) -> None:
-        key = f"{signal.symbol}:{signal.side}"
-        old_task = self.confirmation_tasks.get(key)
-        if old_task and not old_task.done():
-            old_task.cancel()
-
-        async def _confirm() -> None:
-            try:
-                await asyncio.sleep(CONFIRMATION_DELAY_SEC)
-                state = self.market.get(signal.symbol)
-                if not state or state.last_price <= 0:
-                    return
-
-                current_price = state.last_price
-                move_pct = self._pct_change(signal.end_price, current_price)
-
-                if signal.side == "buy" and move_pct >= CONFIRMATION_PRICE_MOVE_PCT:
-                    await self._alert_large_order_flow_confirmed(signal, move_pct)
-                elif signal.side == "sell" and move_pct <= -CONFIRMATION_PRICE_MOVE_PCT:
-                    await self._alert_large_order_flow_confirmed(signal, move_pct)
-            except asyncio.CancelledError:
-                return
-
-        self.confirmation_tasks[key] = asyncio.create_task(_confirm())
+        await self._maybe_alert(f"absorption:{symbol}:{result['type']}", msg)
 
     async def _health(self, request: web.Request) -> web.Response:
         now = time.time()
-        data = {
+        return web.json_response({
             "ok": True,
             "connected": self.runtime.connected,
             "ws_url": self.runtime.ws_url,
@@ -673,16 +461,14 @@ class AltcoinScanner:
             "last_message_at": self.runtime.last_message_at,
             "reconnect_count": self.runtime.reconnect_count,
             "universe_size": self.runtime.universe_size,
-            "futures_symbol_count": len(self.universe.futures_symbols),
+            "subscribed_count": self.runtime.subscribed_count,
             "spot_symbol_count": len(self.universe.spot_symbols),
-            "hot_pool_size": self.runtime.hot_pool_size,
+            "futures_symbol_count": len(self.universe.futures_symbols),
             "last_error": self.runtime.last_error,
-            "hot_symbols": sorted(list(self.hot_symbols))[:50],
-        }
-        return web.json_response(data)
+        })
 
     async def _root(self, request: web.Request) -> web.Response:
-        return web.Response(text="altcoin scanner is running")
+        return web.Response(text="order-flow scanner is running")
 
     async def _start_health_server(self) -> None:
         app = web.Application()
@@ -691,7 +477,6 @@ class AltcoinScanner:
 
         self.health_runner = web.AppRunner(app)
         await self.health_runner.setup()
-
         site = web.TCPSite(self.health_runner, "0.0.0.0", PORT)
         await site.start()
         logging.info("健康检查服务已启动: 0.0.0.0:%s", PORT)
@@ -725,6 +510,23 @@ class AltcoinScanner:
             else:
                 logging.info("WebSocket 控制响应: %s", payload)
 
+    def _reselect_active_symbols(self) -> Tuple[Set[str], Set[str]]:
+        ranked = sorted(
+            (
+                s for s, st in self.market.items()
+                if s in self.universe.allowed_symbols and st.quote_volume_24h >= MIN_24H_QUOTE_VOLUME
+            ),
+            key=lambda x: self.market[x].quote_volume_24h,
+            reverse=True
+        )
+
+        next_set = set(ranked[:TOP_N_SUBSCRIBE])
+        added = next_set - self.active_symbols
+        removed = self.active_symbols - next_set
+        self.active_symbols = next_set
+        self.runtime.subscribed_count = len(self.active_symbols)
+        return added, removed
+
     async def _handle_mini_ticker_arr(self, arr: list) -> None:
         now = time.time()
 
@@ -733,74 +535,60 @@ class AltcoinScanner:
             if symbol not in self.universe.allowed_symbols:
                 continue
 
-            price = float(item.get("c", 0.0))
-            open_24h = float(item.get("o", 0.0))
-            high_24h = float(item.get("h", 0.0))
-            low_24h = float(item.get("l", 0.0))
-            base_volume = float(item.get("v", 0.0))
-            quote_volume = float(item.get("q", 0.0))
-
             st = self.market.get(symbol)
             if st is None:
                 st = MiniTickerState(symbol=symbol)
                 self.market[symbol] = st
 
-            st.last_price = price
-            st.open_24h = open_24h
-            st.high_24h = high_24h
-            st.low_24h = low_24h
-            st.base_volume_24h = base_volume
-            st.quote_volume_24h = quote_volume
+            st.last_price = float(item.get("c", 0.0))
+            st.quote_volume_24h = float(item.get("q", 0.0))
             st.last_update_ts = now
-            st.recent_prices.append((now, price))
 
-        if now - self._last_hot_rebalance >= HOT_REBALANCE_SEC:
-            self._last_hot_rebalance = now
-            added, removed = self._rebalance_hot_pool()
+        added, removed = self._reselect_active_symbols()
 
-            unsub = []
-            sub = []
+        unsub = []
+        sub = []
 
-            for s in sorted(removed):
-                unsub.append(f"{s.lower()}@bookTicker")
-                unsub.append(f"{s.lower()}@aggTrade")
+        for s in sorted(removed):
+            unsub.append(f"{s.lower()}@aggTrade")
+            unsub.append(f"{s.lower()}@bookTicker")
 
-            for s in sorted(added):
-                sub.append(f"{s.lower()}@bookTicker")
-                sub.append(f"{s.lower()}@aggTrade")
+        for s in sorted(added):
+            sub.append(f"{s.lower()}@aggTrade")
+            sub.append(f"{s.lower()}@bookTicker")
 
-            if unsub:
-                await self._unsubscribe_streams(unsub)
-            if sub:
-                await self._subscribe_streams(sub)
-
-            for symbol in sorted(added):
-                await self._alert_hot_entry(symbol)
-
-            for symbol in list(self.hot_symbols):
-                await self._alert_momentum(symbol)
+        if unsub:
+            await self._unsubscribe_streams(unsub)
+        if sub:
+            await self._subscribe_streams(sub)
 
     async def _handle_book_ticker(self, data: dict) -> None:
         symbol = data.get("s", "").upper()
-        if symbol not in self.hot_symbols:
+        if symbol not in self.active_symbols:
             return
 
-        self.book[symbol].bid = float(data.get("b", 0.0))
-        self.book[symbol].ask = float(data.get("a", 0.0))
-        self.book[symbol].last_update_ts = time.time()
+        snap = BookTickerSnapshot(
+            ts=time.time(),
+            bid=float(data.get("b", 0.0)),
+            ask=float(data.get("a", 0.0)),
+            bid_qty=float(data.get("B", 0.0)),
+            ask_qty=float(data.get("A", 0.0)),
+        )
+        self.book_flow[symbol].append(snap)
 
     async def _handle_agg_trade(self, data: dict) -> None:
         symbol = data.get("s", "").upper()
-        if symbol not in self.hot_symbols:
+        if symbol not in self.active_symbols:
             return
 
         price = float(data.get("p", 0.0))
         qty = float(data.get("q", 0.0))
         ts = float(data.get("T", 0)) / 1000.0
+        notional = price * qty
 
+        # m=true => buyer is maker => 主动卖盘
         is_buyer_maker = bool(data.get("m", False))
         side = "sell" if is_buyer_maker else "buy"
-        notional = price * qty
 
         event = AggTradeEvent(
             ts=ts,
@@ -811,24 +599,13 @@ class AltcoinScanner:
         )
         self.trade_flow[symbol].append(event)
 
-        result = self._detect_large_order_flow(symbol)
-        if result:
-            pending = PendingFlowSignal(
-                symbol=symbol,
-                side=result["side"],
-                created_at=time.time(),
-                start_price=result["start_price"],
-                end_price=result["end_price"],
-                dominant_notional=result["dominant_notional"],
-                total_notional=result["total_notional"],
-                side_ratio=result["side_ratio"],
-                trade_count=result["trade_count"],
-                max_trade_notional=result["max_trade_notional"],
-                imbalance_ratio=result["imbalance_ratio"],
-                breakout_ok=True,
-            )
-            self.pending_confirmations[f"{symbol}:{result['side']}"] = pending
-            await self._schedule_confirmation(pending)
+        aggressive = self._detect_aggressive_flow(symbol)
+        if aggressive:
+            await self._alert_aggressive_flow(symbol, aggressive)
+
+        absorption = self._detect_absorption(symbol)
+        if absorption:
+            await self._alert_absorption(symbol, absorption)
 
     async def _handle_message(self, raw: str) -> None:
         self.runtime.last_message_at = time.time()
@@ -845,12 +622,12 @@ class AltcoinScanner:
             await self._handle_mini_ticker_arr(data)
             return
 
-        if stream.endswith("@bookTicker"):
-            await self._handle_book_ticker(data)
-            return
-
         if stream.endswith("@aggTrade"):
             await self._handle_agg_trade(data)
+            return
+
+        if stream.endswith("@bookTicker"):
+            await self._handle_book_ticker(data)
             return
 
     async def _periodic_universe_refresh(self) -> None:
@@ -862,15 +639,15 @@ class AltcoinScanner:
         await self.universe.refresh()
         self.runtime.universe_size = len(self.universe.allowed_symbols)
 
-        invalid_hot = {s for s in self.hot_symbols if s not in self.universe.allowed_symbols}
-        if invalid_hot:
+        invalid_active = {s for s in self.active_symbols if s not in self.universe.allowed_symbols}
+        if invalid_active:
             unsub = []
-            for s in sorted(invalid_hot):
-                unsub.append(f"{s.lower()}@bookTicker")
+            for s in sorted(invalid_active):
                 unsub.append(f"{s.lower()}@aggTrade")
+                unsub.append(f"{s.lower()}@bookTicker")
             await self._unsubscribe_streams(unsub)
-            self.hot_symbols -= invalid_hot
-            self.runtime.hot_pool_size = len(self.hot_symbols)
+            self.active_symbols -= invalid_active
+            self.runtime.subscribed_count = len(self.active_symbols)
 
     async def start(self) -> None:
         await self.universe.start()
@@ -884,21 +661,15 @@ class AltcoinScanner:
 
         await self.notifier.send(
             "【系统启动成功】\n"
-            "山寨币全市场扫描已启动\n"
-            "仅监控：有 USDⓈ-M 合约的币种\n"
-            "重点监控：大单推动 + 订单流失衡 + 延续确认\n"
-            "已启用：机器人噪音过滤"
+            "仅监控有 USDⓈ-M 合约的币种\n"
+            "仅监控：大额主动成交 / 疑似限价承接与压盘\n"
+            "不使用涨跌幅、热度分数"
         )
 
         await self._run()
 
     async def close(self) -> None:
         self.runtime.connected = False
-
-        for task in self.confirmation_tasks.values():
-            if not task.done():
-                task.cancel()
-
         await self.universe.close()
         await self.notifier.close()
 
@@ -970,7 +741,7 @@ def setup_logging() -> None:
 
 async def main() -> None:
     setup_logging()
-    scanner = AltcoinScanner()
+    scanner = OrderFlowScanner()
     loop = asyncio.get_running_loop()
 
     def _shutdown() -> None:
