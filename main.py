@@ -27,7 +27,6 @@ PORT = int(os.getenv("PORT", "8080"))
 ENABLE_HEALTHCHECK = os.getenv("ENABLE_HEALTHCHECK", "true").lower() == "true"
 RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "5"))
 
-# 改为环境变量读取，避免泄露敏感信息
 TELEGRAM_BOT_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
 TELEGRAM_CHAT_ID = "6308781694"
 
@@ -38,7 +37,6 @@ UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC", "1800"))
 TOP_N_SUBSCRIBE = int(os.getenv("TOP_N_SUBSCRIBE", "80"))
 MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "1000000"))
 
-# 关键修复：允许 Futures 不可用时退回现货白名单模式
 ALLOW_SPOT_FALLBACK = os.getenv("ALLOW_SPOT_FALLBACK", "true").lower() == "true"
 
 EXCLUDED_BASE_ASSETS: Set[str] = {
@@ -59,7 +57,6 @@ EXCLUDED_SYMBOLS: Set[str] = {
     if x.strip()
 }
 
-# Upbit 热门币白名单（静态建议版，可用环境变量覆盖）
 UPBIT_HOT_SYMBOLS: Set[str] = {
     x.strip().upper()
     for x in os.getenv(
@@ -81,20 +78,17 @@ UPBIT_HOT_SYMBOLS: Set[str] = {
 
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "180"))
 
-# 大额主动成交
 AGGRESSIVE_LARGE_NOTIONAL = float(os.getenv("AGGRESSIVE_LARGE_NOTIONAL", "80000"))
 AGGRESSIVE_CLUSTER_WINDOW_SEC = float(os.getenv("AGGRESSIVE_CLUSTER_WINDOW_SEC", "2.0"))
 AGGRESSIVE_CLUSTER_MIN_NOTIONAL = float(os.getenv("AGGRESSIVE_CLUSTER_MIN_NOTIONAL", "180000"))
 AGGRESSIVE_MIN_SIDE_DOMINANCE = float(os.getenv("AGGRESSIVE_MIN_SIDE_DOMINANCE", "0.75"))
 AGGRESSIVE_MIN_TRADE_COUNT = int(os.getenv("AGGRESSIVE_MIN_TRADE_COUNT", "2"))
 
-# 限价承接 / 压盘 近似识别
 ABSORPTION_WINDOW_SEC = float(os.getenv("ABSORPTION_WINDOW_SEC", "3.0"))
 ABSORPTION_MIN_NOTIONAL = float(os.getenv("ABSORPTION_MIN_NOTIONAL", "150000"))
 ABSORPTION_MAX_PRICE_MOVE_PCT = float(os.getenv("ABSORPTION_MAX_PRICE_MOVE_PCT", "0.12"))
 ABSORPTION_MIN_BOOK_UPDATES = int(os.getenv("ABSORPTION_MIN_BOOK_UPDATES", "3"))
 
-# 机器人噪音过滤
 BOT_MAX_MICRO_NOTIONAL = float(os.getenv("BOT_MAX_MICRO_NOTIONAL", "3000"))
 BOT_ALTERNATING_COUNT = int(os.getenv("BOT_ALTERNATING_COUNT", "8"))
 BOT_BURST_WINDOW_SEC = float(os.getenv("BOT_BURST_WINDOW_SEC", "2.0"))
@@ -268,15 +262,13 @@ class BinanceUniverse:
                     if env_symbols:
                         self.futures_source = "env"
                         logging.warning(
-                            "Futures API 返回 451，已改用环境变量 FUTURES_SYMBOLS，共 %s 个币种",
+                            "期货API返回451，已改用环境变量 FUTURES_SYMBOLS，共 %s 个币种",
                             len(env_symbols),
                         )
                         return env_symbols
 
                     self.futures_source = "missing_env"
-                    logging.warning(
-                        "Futures API 返回 451，且未设置 FUTURES_SYMBOLS。"
-                    )
+                    logging.warning("期货API返回451，且未设置FUTURES_SYMBOLS。")
                     return set()
 
                 resp.raise_for_status()
@@ -287,15 +279,13 @@ class BinanceUniverse:
                 if env_symbols:
                     self.futures_source = "env"
                     logging.warning(
-                        "Futures API 返回 451，已改用环境变量 FUTURES_SYMBOLS，共 %s 个币种",
+                        "期货API返回451，已改用环境变量 FUTURES_SYMBOLS，共 %s 个币种",
                         len(env_symbols),
                     )
                     return env_symbols
 
                 self.futures_source = "missing_env"
-                logging.warning(
-                    "Futures API 返回 451，且未设置 FUTURES_SYMBOLS。"
-                )
+                logging.warning("期货API返回451，且未设置FUTURES_SYMBOLS。")
                 return set()
 
             self.futures_source = "error"
@@ -343,10 +333,6 @@ class BinanceUniverse:
         self.spot_symbols = spot_symbols
         self.futures_symbols = futures_symbols
 
-        # 关键修复：
-        # 原逻辑是 (spot & futures) & whitelist
-        # 一旦 futures 是空，最终 allowed_symbols 一定是空。
-        # 现在支持 fallback 到现货白名单模式。
         if futures_symbols:
             self.allowed_symbols = (spot_symbols & futures_symbols) & UPBIT_HOT_SYMBOLS
             self.monitor_mode = "futures_intersection"
@@ -358,7 +344,7 @@ class BinanceUniverse:
             self.monitor_mode = "empty"
 
         logging.info(
-            "交易池刷新完成：现货山寨币=%s，合约符号种=%s，Upbit白名单=%s，最终可监控=%s，合约来源=%s，监控模式=%s",
+            "交易池刷新完成：现货山寨币=%s，合约符号种类=%s，Upbit白名单=%s，最终可监控=%s，合约来源=%s，监控模式=%s",
             len(spot_symbols),
             len(futures_symbols),
             len(UPBIT_HOT_SYMBOLS),
@@ -551,7 +537,6 @@ class OrderFlowScanner:
             title = "【疑似大额限价卖单压盘】"
             reason = "主动买盘成交很多，但价格并未明显上涨"
 
-        # 修复：原代码定义了 title，但消息里没输出
         msg = (
             f"{title}\n"
             f"币种：{symbol}\n"
@@ -621,7 +606,7 @@ class OrderFlowScanner:
     async def _handle_control_response(self, payload: dict) -> None:
         if "result" in payload:
             if payload.get("result") is None:
-                logging.info("WebSocket 订阅操作成功，id=%s", payload.get("id"))
+                logging.info("WebSocket订阅操作成功，id=%s", payload.get("id"))
             else:
                 logging.info("WebSocket 控制响应: %s", payload)
 
@@ -724,8 +709,6 @@ class OrderFlowScanner:
             return
 
         notional = price * qty
-
-        # m=true => buyer is maker => 主动卖盘
         is_buyer_maker = bool(data.get("m", False))
         side = "sell" if is_buyer_maker else "buy"
 
@@ -800,6 +783,7 @@ class OrderFlowScanner:
         await self.universe.start()
         await self.universe.refresh()
         self.runtime.universe_size = len(self.universe.allowed_symbols)
+        self._last_universe_refresh = time.time()  # 修复：避免启动后立即再次 refresh
 
         await self.notifier.start()
 
@@ -909,7 +893,7 @@ class OrderFlowScanner:
 def setup_logging() -> None:
     logging.basicConfig(
         level=getattr(logging, LOG_LEVEL, logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(message)s",
+        format="%(asctime)s |%(levelname)s| %(message)s",
     )
 
 
@@ -927,7 +911,6 @@ async def main() -> None:
             try:
                 loop.add_signal_handler(getattr(signal, sig_name), _shutdown)
             except NotImplementedError:
-                # Windows 某些事件循环不支持
                 pass
 
     try:
