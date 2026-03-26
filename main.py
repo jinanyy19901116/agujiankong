@@ -7,7 +7,7 @@ import statistics
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Set
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 from aiohttp import web
@@ -19,8 +19,14 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 # 配置
 # =========================================================
 
-FUTURES_REST_BASE = os.getenv("FUTURES_REST_BASE", "https://fapi.binance.com").rstrip("/")
-FUTURES_WS_ORIGIN = os.getenv("FUTURES_WS_ORIGIN", "wss://fstream.binance.com").rstrip("/")
+USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() == "true"
+
+if USE_TESTNET:
+    FUTURES_REST_BASE = "https://demo-fapi.binance.com"
+    FUTURES_WS_ORIGIN = "wss://fstream.binancefuture.com"
+else:
+    FUTURES_REST_BASE = "https://fapi.binance.com"
+    FUTURES_WS_ORIGIN = "wss://fstream.binance.com"
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PORT = int(os.getenv("PORT", "8080"))
@@ -31,7 +37,6 @@ EMPTY_UNIVERSE_RETRY_SEC = int(os.getenv("EMPTY_UNIVERSE_RETRY_SEC", "60"))
 
 TELEGRAM_BOT_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
 TELEGRAM_CHAT_ID = "6308781694"
-
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT").upper()
 TOP_N_FUTURES = int(os.getenv("TOP_N_FUTURES", "20"))
 MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "20000000"))
@@ -82,6 +87,11 @@ BOT_REPEAT_WINDOW_SEC = float(os.getenv("BOT_REPEAT_WINDOW_SEC", "2.0"))
 BOT_TIMING_SAMPLE_SIZE = int(os.getenv("BOT_TIMING_SAMPLE_SIZE", "8"))
 BOT_TIMING_STD_MAX = float(os.getenv("BOT_TIMING_STD_MAX", "0.035"))
 BOT_TIMING_WINDOW_SEC = float(os.getenv("BOT_TIMING_WINDOW_SEC", "2.0"))
+
+# REST 重试
+REST_TIMEOUT_SEC = int(os.getenv("REST_TIMEOUT_SEC", "15"))
+REST_MAX_RETRIES = int(os.getenv("REST_MAX_RETRIES", "4"))
+REST_BACKOFF_BASE_SEC = float(os.getenv("REST_BACKOFF_BASE_SEC", "0.2"))
 
 
 # =========================================================
@@ -153,26 +163,182 @@ class TelegramNotifier:
 
 
 # =========================================================
-# Futures Universe
+# Futures REST Client
 # =========================================================
 
-class FuturesUniverse:
-    def __init__(self, futures_rest_base: str):
-        self.futures_rest_base = futures_rest_base
+class FuturesApiError(Exception):
+    def __init__(self, status: int, message: str, payload: Any = None):
+        super().__init__(message)
+        self.status = status
+        self.payload = payload
+
+
+class FuturesRestClient:
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
         self.session: Optional[aiohttp.ClientSession] = None
-        self.all_symbols: Set[str] = set()
-        self.allowed_symbols: Set[str] = set()
-        self.source: str = "unknown"  # api / env / default / error
 
     async def start(self) -> None:
         if self.session is None:
-            timeout = aiohttp.ClientTimeout(total=20)
+            timeout = aiohttp.ClientTimeout(total=REST_TIMEOUT_SEC)
             self.session = aiohttp.ClientSession(timeout=timeout)
 
     async def close(self) -> None:
         if self.session:
             await self.session.close()
             self.session = None
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Any], Optional[str]]:
+        """
+        返回: (json_data, fallback_reason)
+        fallback_reason 用于上层决定是否退回默认合约列表
+        """
+        if self.session is None:
+            await self.start()
+
+        assert self.session is not None
+        url = f"{self.base_url}{path}"
+        backoff = REST_BACKOFF_BASE_SEC
+
+        for attempt in range(1, REST_MAX_RETRIES + 1):
+            try:
+                async with self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    data=data,
+                ) as resp:
+                    text = await resp.text()
+                    status = resp.status
+
+                    # 451：地区/法律限制
+                    if status == 451:
+                        return None, "451"
+
+                    # 403：WAF
+                    if status == 403:
+                        logging.warning("REST 403(WAF): %s %s", path, text[:300])
+                        return None, "403"
+
+                    # 418：被封
+                    if status == 418:
+                        logging.error("REST 418(IP被封): %s %s", path, text[:300])
+                        return None, "418"
+
+                    # 429：限流
+                    if status == 429:
+                        logging.warning("REST 429(限流): %s %s", path, text[:300])
+                        if attempt < REST_MAX_RETRIES:
+                            await asyncio.sleep(backoff)
+                            backoff *= 2
+                            continue
+                        return None, "429"
+
+                    # 408：超时
+                    if status == 408:
+                        logging.warning("REST 408(后端超时): %s %s", path, text[:300])
+                        if attempt < REST_MAX_RETRIES:
+                            await asyncio.sleep(backoff)
+                            backoff *= 2
+                            continue
+                        return None, "408"
+
+                    # 503：按你贴的规则处理
+                    if status == 503:
+                        low = text.lower()
+                        if "unknown error" in low or "unknown" in low:
+                            logging.warning("REST 503(执行状态未知): %s %s", path, text[:300])
+                            if attempt < REST_MAX_RETRIES:
+                                await asyncio.sleep(backoff)
+                                backoff *= 2
+                                continue
+                            return None, "503_unknown"
+
+                        if "service unavailable" in low:
+                            logging.warning("REST 503(服务不可用): %s %s", path, text[:300])
+                            if attempt < REST_MAX_RETRIES:
+                                await asyncio.sleep(backoff)
+                                backoff *= 2
+                                continue
+                            return None, "503_unavailable"
+
+                        if "-1008" in text or "system-level protection" in low or "system level protection" in low:
+                            logging.warning("REST 503(-1008系统保护): %s %s", path, text[:300])
+                            if attempt < REST_MAX_RETRIES:
+                                await asyncio.sleep(backoff)
+                                backoff *= 2
+                                continue
+                            return None, "-1008"
+
+                        logging.warning("REST 503: %s %s", path, text[:300])
+                        if attempt < REST_MAX_RETRIES:
+                            await asyncio.sleep(backoff)
+                            backoff *= 2
+                            continue
+                        return None, "503"
+
+                    # 其他 4xx/5xx
+                    if status >= 400:
+                        logging.warning("REST 非200: status=%s path=%s body=%s", status, path, text[:300])
+                        return None, f"http_{status}"
+
+                    try:
+                        return json.loads(text), None
+                    except json.JSONDecodeError:
+                        logging.warning("REST 返回非JSON: path=%s body=%s", path, text[:300])
+                        return None, "non_json"
+
+            except asyncio.TimeoutError:
+                logging.warning("REST 请求超时: %s attempt=%s", path, attempt)
+                if attempt < REST_MAX_RETRIES:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                return None, "timeout"
+
+            except aiohttp.ClientError as e:
+                logging.warning("REST 网络异常: %s attempt=%s err=%s", path, attempt, repr(e))
+                if attempt < REST_MAX_RETRIES:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                return None, "client_error"
+
+            except Exception as e:
+                logging.exception("REST 未知异常: path=%s err=%s", path, repr(e))
+                return None, "exception"
+
+        return None, "unknown"
+
+    async def get_exchange_info(self) -> Tuple[Optional[Any], Optional[str]]:
+        return await self._request_json("GET", "/fapi/v1/exchangeInfo")
+
+    async def get_24h_tickers(self) -> Tuple[Optional[Any], Optional[str]]:
+        return await self._request_json("GET", "/fapi/v1/ticker/24hr")
+
+
+# =========================================================
+# Futures Universe
+# =========================================================
+
+class FuturesUniverse:
+    def __init__(self, rest_client: FuturesRestClient):
+        self.rest_client = rest_client
+        self.all_symbols: Set[str] = set()
+        self.allowed_symbols: Set[str] = set()
+        self.source: str = "unknown"  # api / env / default / error
+
+    async def start(self) -> None:
+        await self.rest_client.start()
+
+    async def close(self) -> None:
+        await self.rest_client.close()
 
     def _load_futures_symbols(self) -> Set[str]:
         raw = os.getenv("FUTURES_SYMBOLS", "").strip()
@@ -181,103 +347,54 @@ class FuturesUniverse:
         return set(DEFAULT_FUTURES_SYMBOLS)
 
     async def _fetch_futures_exchange_info(self) -> Set[str]:
-        if self.session is None:
-            await self.start()
-
         fallback_symbols = self._load_futures_symbols()
-        url = f"{self.futures_rest_base}/fapi/v1/exchangeInfo"
+        data, reason = await self.rest_client.get_exchange_info()
 
-        try:
-            async with self.session.get(url) as resp:
-                text = await resp.text()
-
-                if resp.status == 451:
-                    if fallback_symbols:
-                        self.source = "default" if not os.getenv("FUTURES_SYMBOLS", "").strip() else "env"
-                        logging.warning(
-                            "期货API返回451，已改用%s合约列表，共 %s 个币种",
-                            "内置默认" if self.source == "default" else "FUTURES_SYMBOLS",
-                            len(fallback_symbols),
-                        )
-                        return fallback_symbols
-                    self.source = "error"
-                    logging.warning("期货API返回451，且没有可用回退合约列表。")
-                    return set()
-
-                if resp.status != 200:
-                    self.source = "error"
-                    logging.warning("Futures exchangeInfo 非200: status=%s body=%s", resp.status, text[:300])
-                    if fallback_symbols:
-                        self.source = "default" if not os.getenv("FUTURES_SYMBOLS", "").strip() else "env"
-                        return fallback_symbols
-                    return set()
-
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError:
-                    self.source = "error"
-                    logging.warning("Futures exchangeInfo 返回的不是JSON: %s", text[:300])
-                    if fallback_symbols:
-                        self.source = "default" if not os.getenv("FUTURES_SYMBOLS", "").strip() else "env"
-                        return fallback_symbols
-                    return set()
-
-        except Exception:
+        if data is None:
             if fallback_symbols:
                 self.source = "default" if not os.getenv("FUTURES_SYMBOLS", "").strip() else "env"
-                logging.exception("获取 Futures exchangeInfo 失败，已改用回退合约列表")
+                logging.warning(
+                    "exchangeInfo 获取失败(reason=%s)，已改用%s合约列表，共 %s 个币种",
+                    reason,
+                    "内置默认" if self.source == "default" else "FUTURES_SYMBOLS",
+                    len(fallback_symbols),
+                )
                 return fallback_symbols
+
             self.source = "error"
-            logging.exception("获取 Futures exchangeInfo 失败，且没有可用回退合约列表")
+            logging.warning("exchangeInfo 获取失败(reason=%s)，且没有可用回退合约列表", reason)
             return set()
 
         symbols: Set[str] = set()
         for item in data.get("symbols", []):
             if not isinstance(item, dict):
                 continue
+
             symbol = item.get("symbol", "").upper()
             status = item.get("status", "")
             quote_asset = item.get("quoteAsset", "").upper()
             contract_type = item.get("contractType", "")
+
             if status != "TRADING":
                 continue
             if quote_asset != QUOTE_ASSET:
                 continue
             if contract_type != "PERPETUAL":
                 continue
+
             symbols.add(symbol)
 
         self.source = "api"
         return symbols
 
     async def _fetch_futures_24h_tickers(self) -> List[dict]:
-        if self.session is None:
-            await self.start()
-
-        url = f"{self.futures_rest_base}/fapi/v1/ticker/24hr"
-        try:
-            async with self.session.get(url) as resp:
-                text = await resp.text()
-
-                if resp.status != 200:
-                    logging.warning("Futures 24hr 非200: status=%s body=%s", resp.status, text[:300])
-                    return []
-
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError:
-                    logging.warning("Futures 24hr 返回的不是JSON: %s", text[:300])
-                    return []
-
-                return data if isinstance(data, list) else []
-        except Exception:
-            logging.exception("获取 Futures 24hr 数据失败")
+        data, reason = await self.rest_client.get_24h_tickers()
+        if data is None:
+            logging.warning("24h ticker 获取失败: %s", reason)
             return []
+        return data if isinstance(data, list) else []
 
     async def refresh(self) -> None:
-        if self.session is None:
-            await self.start()
-
         symbols = await self._fetch_futures_exchange_info()
         self.all_symbols = symbols
 
@@ -300,7 +417,10 @@ class FuturesUniverse:
             self.allowed_symbols = set(sorted(symbols)[:TOP_N_FUTURES])
             logging.info(
                 "纯合约交易池刷新完成：全部合约=%s，24h排行不可用，退化使用前%s个，最终=%s，来源=%s",
-                len(symbols), TOP_N_FUTURES, len(self.allowed_symbols), self.source
+                len(symbols),
+                TOP_N_FUTURES,
+                len(self.allowed_symbols),
+                self.source,
             )
             return
 
@@ -308,15 +428,19 @@ class FuturesUniverse:
         for item in tickers:
             if not isinstance(item, dict):
                 continue
+
             symbol = item.get("symbol", "").upper()
             if symbol not in symbols:
                 continue
+
             try:
                 quote_volume = float(item.get("quoteVolume", 0.0) or 0.0)
             except (TypeError, ValueError):
                 continue
+
             if quote_volume < MIN_24H_QUOTE_VOLUME:
                 continue
+
             ranked.append((symbol, quote_volume))
 
         ranked.sort(key=lambda x: x[1], reverse=True)
@@ -327,7 +451,10 @@ class FuturesUniverse:
 
         logging.info(
             "纯合约交易池刷新完成：全部合约=%s，24h达标=%s，最终订阅=%s，来源=%s",
-            len(symbols), len(ranked), len(self.allowed_symbols), self.source
+            len(symbols),
+            len(ranked),
+            len(self.allowed_symbols),
+            self.source,
         )
 
 
@@ -338,7 +465,8 @@ class FuturesUniverse:
 class FuturesOrderFlowScanner:
     def __init__(self):
         self.runtime = RuntimeStatus()
-        self.universe = FuturesUniverse(FUTURES_REST_BASE)
+        self.rest_client = FuturesRestClient(FUTURES_REST_BASE)
+        self.universe = FuturesUniverse(self.rest_client)
         self.notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
         self.trade_flow: Dict[str, Deque[AggTradeEvent]] = defaultdict(lambda: deque(maxlen=5000))
@@ -374,6 +502,7 @@ class FuturesOrderFlowScanner:
         micro = [e for e in events if e.notional <= BOT_MAX_MICRO_NOTIONAL]
         if len(micro) < BOT_ALTERNATING_COUNT:
             return False
+
         recent = micro[-BOT_ALTERNATING_COUNT:]
         sides = [e.side for e in recent]
         alternating = sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1])
@@ -383,16 +512,19 @@ class FuturesOrderFlowScanner:
     def _is_repetitive_size_bot(self, events: List[AggTradeEvent]) -> bool:
         if len(events) < BOT_REPEAT_SAMPLE_SIZE:
             return False
+
         recent = events[-BOT_REPEAT_SAMPLE_SIZE:]
         span = recent[-1].ts - recent[0].ts
         if span > BOT_REPEAT_WINDOW_SEC:
             return False
+
         qty_keys = {round(e.qty, 6) for e in recent}
         notional_keys = {round(e.notional, 1) for e in recent}
         same_side_ratio = max(
             sum(1 for e in recent if e.side == "buy"),
             sum(1 for e in recent if e.side == "sell"),
         ) / len(recent)
+
         return (
             len(qty_keys) <= BOT_REPEAT_QTY_UNIQUENESS_MAX
             and len(notional_keys) <= BOT_REPEAT_NOTIONAL_UNIQUENESS_MAX
@@ -402,6 +534,7 @@ class FuturesOrderFlowScanner:
     def _is_uniform_timing_bot(self, events: List[AggTradeEvent]) -> bool:
         if len(events) < BOT_TIMING_SAMPLE_SIZE:
             return False
+
         recent = events[-BOT_TIMING_SAMPLE_SIZE:]
         span = recent[-1].ts - recent[0].ts
         if span > BOT_TIMING_WINDOW_SEC:
@@ -450,19 +583,21 @@ class FuturesOrderFlowScanner:
     def _detect_single_large_market_order(self, symbol: str, event: AggTradeEvent) -> Optional[dict]:
         if event.notional < SINGLE_PRINT_NOTIONAL:
             return None
+
         recent = self._get_trade_window(symbol, 1.2)
         if self._is_bot_or_arb_noise(recent):
             return None
+
         return {
             "type": "single_buy" if event.side == "buy" else "single_sell",
             "price": event.price,
             "qty": event.qty,
             "notional": event.notional,
-            "side": event.side,
         }
 
     def _detect_aggressive_cluster(self, symbol: str) -> Optional[dict]:
         events = self._get_trade_window(symbol, FLOW_WINDOW_SEC)
+
         if len(events) < FLOW_MIN_TRADE_COUNT:
             return None
         if self._is_bot_or_arb_noise(events):
@@ -471,12 +606,14 @@ class FuturesOrderFlowScanner:
         buy_notional = sum(e.notional for e in events if e.side == "buy")
         sell_notional = sum(e.notional for e in events if e.side == "sell")
         total_notional = buy_notional + sell_notional
+
         if total_notional < FLOW_MIN_TOTAL_NOTIONAL:
             return None
 
         dominant_side = "buy" if buy_notional >= sell_notional else "sell"
         dominant_notional = max(buy_notional, sell_notional)
         dominance = dominant_notional / total_notional if total_notional > 0 else 0.0
+
         if dominance < FLOW_MIN_DOMINANCE:
             return None
 
@@ -678,6 +815,7 @@ class FuturesOrderFlowScanner:
 
         await self.notifier.send(
             "【系统启动成功】\n"
+            f"网络：{'Testnet' if USE_TESTNET else 'Mainnet'}\n"
             "模式：纯合约即时主动成交监控\n"
             "仅推送：超大市价单 / 短时大额主动买卖簇\n"
             "已启用：刷单机器人 / 套利噪音过滤\n"
