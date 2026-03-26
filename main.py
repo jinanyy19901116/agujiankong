@@ -30,7 +30,7 @@ RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "5"))
 
 # Telegram
 TELEGRAM_BOT_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
-TELEGRAM_CHAT_ID =  "6308781694"
+TELEGRAM_CHAT_ID = "6308781694"
 
 # 市场扫描
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT").upper()
@@ -60,11 +60,9 @@ EXCLUDED_SYMBOLS: Set[str] = {
     if x.strip()
 }
 
-# 告警与策略
+# 热点与动量
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "300"))
 HOT_ALERT_THRESHOLD = float(os.getenv("HOT_ALERT_THRESHOLD", "65"))
-SPREAD_ALERT_PCT = float(os.getenv("SPREAD_ALERT_PCT", "0.8"))
-
 MOMENTUM_WINDOW_SEC = int(os.getenv("MOMENTUM_WINDOW_SEC", "180"))
 MOMENTUM_ALERT_PCT = float(os.getenv("MOMENTUM_ALERT_PCT", "5.0"))
 
@@ -74,6 +72,20 @@ WEAK_BUY_SCORE_THRESHOLD = float(os.getenv("WEAK_BUY_SCORE_THRESHOLD", "60"))
 WEAK_BUY_MOMENTUM_THRESHOLD = float(os.getenv("WEAK_BUY_MOMENTUM_THRESHOLD", "1.5"))
 SELL_MOMENTUM_THRESHOLD = float(os.getenv("SELL_MOMENTUM_THRESHOLD", "-3.0"))
 BUY_MAX_SPREAD_PCT = float(os.getenv("BUY_MAX_SPREAD_PCT", "0.5"))
+
+# 大单监控
+LARGE_TRADE_MIN_NOTIONAL = float(os.getenv("LARGE_TRADE_MIN_NOTIONAL", "50000"))
+LARGE_TRADE_CLUSTER_WINDOW_SEC = float(os.getenv("LARGE_TRADE_CLUSTER_WINDOW_SEC", "2.0"))
+LARGE_TRADE_CLUSTER_MIN_NOTIONAL = float(os.getenv("LARGE_TRADE_CLUSTER_MIN_NOTIONAL", "150000"))
+LARGE_TRADE_FOLLOWTHROUGH_PCT = float(os.getenv("LARGE_TRADE_FOLLOWTHROUGH_PCT", "0.35"))
+LARGE_TRADE_MAX_MICRO_NOTIONAL = float(os.getenv("LARGE_TRADE_MAX_MICRO_NOTIONAL", "3000"))
+LARGE_TRADE_MIN_SIDE_DOMINANCE = float(os.getenv("LARGE_TRADE_MIN_SIDE_DOMINANCE", "0.7"))
+LARGE_TRADE_MIN_CLUSTER_COUNT = int(os.getenv("LARGE_TRADE_MIN_CLUSTER_COUNT", "2"))
+ORDER_FLOW_WINDOW_SEC = int(os.getenv("ORDER_FLOW_WINDOW_SEC", "12"))
+
+# 机器人噪音过滤
+BOT_MAX_ALTERNATING_TRADES = int(os.getenv("BOT_MAX_ALTERNATING_TRADES", "8"))
+BOT_MICRO_BURST_WINDOW_SEC = float(os.getenv("BOT_MICRO_BURST_WINDOW_SEC", "2.0"))
 
 
 # =========================================================
@@ -100,6 +112,15 @@ class BookTickerState:
     bid: Optional[float] = None
     ask: Optional[float] = None
     last_update_ts: float = 0.0
+
+
+@dataclass
+class AggTradeEvent:
+    ts: float
+    price: float
+    qty: float
+    notional: float
+    side: str  # "buy" 表示主动买盘, "sell" 表示主动卖盘
 
 
 @dataclass
@@ -146,10 +167,7 @@ class TelegramNotifier:
             await self.start()
 
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        payload = {
-            "chat_id": self.chat_id,
-            "text": text,
-        }
+        payload = {"chat_id": self.chat_id, "text": text}
 
         try:
             async with self.session.post(url, json=payload) as resp:
@@ -169,7 +187,6 @@ class BinanceUniverse:
         self.rest_base = rest_base
         self.session: Optional[aiohttp.ClientSession] = None
         self.allowed_symbols: Set[str] = set()
-        self.meta: Dict[str, dict] = {}
 
     async def start(self) -> None:
         if self.session is None:
@@ -186,16 +203,12 @@ class BinanceUniverse:
             await self.start()
 
         url = f"{self.rest_base}/api/v3/exchangeInfo?permissions=SPOT&symbolStatus=TRADING"
-
         async with self.session.get(url) as resp:
             resp.raise_for_status()
             data = await resp.json()
 
-        symbols = data.get("symbols", [])
         allowed: Set[str] = set()
-        meta: Dict[str, dict] = {}
-
-        for item in symbols:
+        for item in data.get("symbols", []):
             symbol = item.get("symbol", "").upper()
             status = item.get("status", "")
             quote_asset = item.get("quoteAsset", "").upper()
@@ -214,13 +227,8 @@ class BinanceUniverse:
                 continue
 
             allowed.add(symbol)
-            meta[symbol] = {
-                "baseAsset": base_asset,
-                "quoteAsset": quote_asset,
-            }
 
         self.allowed_symbols = allowed
-        self.meta = meta
         logging.info("交易池刷新完成: %s 个山寨币", len(self.allowed_symbols))
 
 
@@ -236,9 +244,11 @@ class AltcoinScanner:
 
         self.market: Dict[str, MiniTickerState] = {}
         self.book: Dict[str, BookTickerState] = defaultdict(BookTickerState)
+        self.trade_flow: Dict[str, Deque[AggTradeEvent]] = defaultdict(lambda: deque(maxlen=2000))
 
         self.hot_symbols: Set[str] = set()
         self.last_alert_at: Dict[str, float] = defaultdict(float)
+        self.last_large_flow_alert_ts: Dict[str, float] = defaultdict(float)
 
         self.ws = None
         self._stop_event = asyncio.Event()
@@ -277,14 +287,12 @@ class AltcoinScanner:
     def _get_spread_pct(self, symbol: str) -> float:
         bid = self.book[symbol].bid
         ask = self.book[symbol].ask
-
         if not bid or not ask or bid <= 0 or ask <= 0:
             return 0.0
 
         mid = (bid + ask) / 2.0
         if mid <= 0:
             return 0.0
-
         return (ask - bid) / mid * 100.0
 
     def _score_symbol(self, state: MiniTickerState, now: float) -> float:
@@ -303,13 +311,12 @@ class AltcoinScanner:
         volume_score = min(30.0, max(0.0, math.log10(max(quote_volume, 1.0)) * 4.0))
         pct_score = max(0.0, min(35.0, pct_24h * 1.2))
         momentum_score = max(0.0, min(35.0, momentum * 4.0))
-
         return round(volume_score + pct_score + momentum_score, 2)
 
     def _rebalance_hot_pool(self) -> Tuple[Set[str], Set[str]]:
         now = time.time()
-
         candidates: List[MiniTickerState] = []
+
         for symbol, state in self.market.items():
             if symbol not in self.universe.allowed_symbols:
                 continue
@@ -343,14 +350,11 @@ class AltcoinScanner:
             return "买入", (
                 f"热度较高（{state.hot_score}），"
                 f"短线动量强（{momentum:.2f}%），"
-                f"买卖价差正常（{spread_pct:.3f}%）"
+                f"价差正常（{spread_pct:.3f}%）"
             )
 
         if momentum <= SELL_MOMENTUM_THRESHOLD:
             return "卖出", f"短线动量转弱（{momentum:.2f}%）"
-
-        if spread_pct >= SPREAD_ALERT_PCT and spread_pct > 0:
-            return "卖出", f"买卖价差过大（{spread_pct:.3f}%），流动性风险上升"
 
         if state.hot_score >= WEAK_BUY_SCORE_THRESHOLD and momentum >= WEAK_BUY_MOMENTUM_THRESHOLD and pct_24h > 0:
             return "买入", (
@@ -358,10 +362,91 @@ class AltcoinScanner:
                 f"短线继续上行（{momentum:.2f}%）"
             )
 
-        return "观望", (
-            f"当前信号不够一致：热度={state.hot_score}，"
-            f"短线动量={momentum:.2f}%"
-        )
+        return "观望", f"当前信号不够一致：热度={state.hot_score}，短线动量={momentum:.2f}%"
+
+    def _recent_flow_window(self, symbol: str, now: float) -> List[AggTradeEvent]:
+        flow = self.trade_flow[symbol]
+        cutoff = now - ORDER_FLOW_WINDOW_SEC
+        while flow and flow[0].ts < cutoff:
+            flow.popleft()
+        return list(flow)
+
+    def _is_bot_noise(self, events: List[AggTradeEvent]) -> bool:
+        if len(events) < BOT_MAX_ALTERNATING_TRADES:
+            return False
+
+        recent = [e for e in events if e.notional <= LARGE_TRADE_MAX_MICRO_NOTIONAL]
+        if len(recent) < BOT_MAX_ALTERNATING_TRADES:
+            return False
+
+        sides = [e.side for e in recent[-BOT_MAX_ALTERNATING_TRADES:]]
+        alternating = 0
+        for i in range(1, len(sides)):
+            if sides[i] != sides[i - 1]:
+                alternating += 1
+
+        time_span = recent[-1].ts - recent[max(0, len(recent) - BOT_MAX_ALTERNATING_TRADES)].ts
+        return alternating >= BOT_MAX_ALTERNATING_TRADES - 1 and time_span <= BOT_MICRO_BURST_WINDOW_SEC
+
+    def _detect_large_order_flow(self, symbol: str) -> Optional[dict]:
+        now = time.time()
+        events = self._recent_flow_window(symbol, now)
+        if len(events) < LARGE_TRADE_MIN_CLUSTER_COUNT:
+            return None
+
+        if self._is_bot_noise(events):
+            return None
+
+        cluster_cutoff = now - LARGE_TRADE_CLUSTER_WINDOW_SEC
+        cluster = [e for e in events if e.ts >= cluster_cutoff]
+
+        if len(cluster) < LARGE_TRADE_MIN_CLUSTER_COUNT:
+            return None
+
+        # 过滤微小成交，聚焦真正有冲击的大单
+        cluster = [e for e in cluster if e.notional >= LARGE_TRADE_MAX_MICRO_NOTIONAL]
+        if len(cluster) < LARGE_TRADE_MIN_CLUSTER_COUNT:
+            return None
+
+        buy_notional = sum(e.notional for e in cluster if e.side == "buy")
+        sell_notional = sum(e.notional for e in cluster if e.side == "sell")
+        total_notional = buy_notional + sell_notional
+
+        if total_notional < LARGE_TRADE_CLUSTER_MIN_NOTIONAL:
+            return None
+
+        dominant_side = "buy" if buy_notional >= sell_notional else "sell"
+        dominant_notional = max(buy_notional, sell_notional)
+        side_ratio = dominant_notional / total_notional if total_notional > 0 else 0.0
+
+        if side_ratio < LARGE_TRADE_MIN_SIDE_DOMINANCE:
+            return None
+
+        # 至少包含一笔真正的大单
+        max_trade_notional = max(e.notional for e in cluster)
+        if max_trade_notional < LARGE_TRADE_MIN_NOTIONAL:
+            return None
+
+        start_price = cluster[0].price
+        end_price = cluster[-1].price
+        price_move_pct = self._pct_change(start_price, end_price)
+
+        if dominant_side == "buy" and price_move_pct < LARGE_TRADE_FOLLOWTHROUGH_PCT:
+            return None
+        if dominant_side == "sell" and price_move_pct > -LARGE_TRADE_FOLLOWTHROUGH_PCT:
+            return None
+
+        return {
+            "side": dominant_side,
+            "total_notional": total_notional,
+            "dominant_notional": dominant_notional,
+            "side_ratio": side_ratio,
+            "price_move_pct": price_move_pct,
+            "trade_count": len(cluster),
+            "max_trade_notional": max_trade_notional,
+            "start_price": start_price,
+            "end_price": end_price,
+        }
 
     # -------------------------
     # 提醒
@@ -377,15 +462,11 @@ class AltcoinScanner:
 
     async def _alert_hot_entry(self, symbol: str) -> None:
         state = self.market.get(symbol)
-        if not state:
+        if not state or state.hot_score < HOT_ALERT_THRESHOLD:
             return
 
         pct_24h = self._pct_change(state.open_24h, state.last_price)
         momentum = self._recent_momentum_pct(state, time.time())
-
-        if state.hot_score < HOT_ALERT_THRESHOLD:
-            return
-
         signal_text, signal_reason = self._get_trade_signal(symbol)
 
         msg = (
@@ -399,7 +480,6 @@ class AltcoinScanner:
             f"{MOMENTUM_WINDOW_SEC // 60}分钟动量：{momentum:.2f}%\n"
             f"最新价格：{state.last_price}"
         )
-
         await self._maybe_alert(f"hot:{symbol}", msg)
 
     async def _alert_momentum(self, symbol: str) -> None:
@@ -424,30 +504,28 @@ class AltcoinScanner:
             f"热度分数：{state.hot_score}\n"
             f"最新价格：{state.last_price}"
         )
-
         await self._maybe_alert(f"mom:{symbol}", msg)
 
-    async def _alert_spread(self, symbol: str) -> None:
-        if symbol not in self.hot_symbols:
-            return
+    async def _alert_large_order_flow(self, symbol: str, result: dict) -> None:
+        side = result["side"]
+        signal = "买入" if side == "buy" else "卖出"
+        direction = "上涨" if side == "buy" else "下跌"
 
-        bid = self.book[symbol].bid
-        ask = self.book[symbol].ask
-        if not bid or not ask or bid <= 0 or ask <= 0:
-            return
-
-        spread_pct = self._get_spread_pct(symbol)
-        if spread_pct >= SPREAD_ALERT_PCT:
-            msg = (
-                f"【流动性风险预警】\n"
-                f"币种：{symbol}\n"
-                f"操作建议：卖出 / 观望\n"
-                f"原因：买卖价差过大，可能滑点增加\n\n"
-                f"买一价：{bid}\n"
-                f"卖一价：{ask}\n"
-                f"价差：{spread_pct:.3f}%"
-            )
-            await self._maybe_alert(f"spread:{symbol}", msg)
+        msg = (
+            f"【大单推动预警】\n"
+            f"币种：{symbol}\n"
+            f"操作建议：{signal}\n"
+            f"原因：检测到主导性大单簇推动价格{direction}\n\n"
+            f"主导方向：{'主动买盘' if side == 'buy' else '主动卖盘'}\n"
+            f"聚合成交额：{result['total_notional']:,.0f} {QUOTE_ASSET}\n"
+            f"主导成交额占比：{result['side_ratio'] * 100:.1f}%\n"
+            f"最大单笔成交额：{result['max_trade_notional']:,.0f} {QUOTE_ASSET}\n"
+            f"成交笔数：{result['trade_count']}\n"
+            f"价格变化：{result['price_move_pct']:.2f}%\n"
+            f"起始价格：{result['start_price']}\n"
+            f"当前价格：{result['end_price']}"
+        )
+        await self._maybe_alert(f"flow:{symbol}:{side}", msg)
 
     # -------------------------
     # 健康检查
@@ -485,7 +563,7 @@ class AltcoinScanner:
         logging.info("健康检查服务已启动: 0.0.0.0:%s", PORT)
 
     # -------------------------
-    # WebSocket 控制
+    # WS 控制
     # -------------------------
 
     async def _subscribe_streams(self, params: List[str]) -> None:
@@ -497,7 +575,7 @@ class AltcoinScanner:
             "id": int(time.time() * 1000) % 100000000,
         }
         await self.ws.send(json.dumps(req))
-        logging.info("订阅 %s 个流", len(params))
+        logging.info("已发送订阅请求: %s", ", ".join(params))
 
     async def _unsubscribe_streams(self, params: List[str]) -> None:
         if not params or self.ws is None:
@@ -508,15 +586,18 @@ class AltcoinScanner:
             "id": int(time.time() * 1000) % 100000000,
         }
         await self.ws.send(json.dumps(req))
-        logging.info("取消订阅 %s 个流", len(params))
+        logging.info("已发送取消订阅请求: %s", ", ".join(params))
+
+    async def _handle_control_response(self, payload: dict) -> None:
+        if "result" in payload:
+            if payload.get("result") is None:
+                logging.info("WebSocket 订阅操作成功，id=%s", payload.get("id"))
+            else:
+                logging.info("WebSocket 控制响应: %s", payload)
 
     # -------------------------
     # 消息处理
     # -------------------------
-
-    async def _handle_control_response(self, payload: dict) -> None:
-        if "result" in payload:
-            logging.info("WS 控制响应: %s", payload)
 
     async def _handle_mini_ticker_arr(self, arr: list) -> None:
         now = time.time()
@@ -551,13 +632,21 @@ class AltcoinScanner:
             self._last_hot_rebalance = now
             added, removed = self._rebalance_hot_pool()
 
-            unsubscribe_list = [f"{s.lower()}@bookTicker" for s in sorted(removed)]
-            subscribe_list = [f"{s.lower()}@bookTicker" for s in sorted(added)]
+            unsub = []
+            sub = []
 
-            if unsubscribe_list:
-                await self._unsubscribe_streams(unsubscribe_list)
-            if subscribe_list:
-                await self._subscribe_streams(subscribe_list)
+            for s in sorted(removed):
+                unsub.append(f"{s.lower()}@bookTicker")
+                unsub.append(f"{s.lower()}@aggTrade")
+
+            for s in sorted(added):
+                sub.append(f"{s.lower()}@bookTicker")
+                sub.append(f"{s.lower()}@aggTrade")
+
+            if unsub:
+                await self._unsubscribe_streams(unsub)
+            if sub:
+                await self._subscribe_streams(sub)
 
             for symbol in sorted(added):
                 await self._alert_hot_entry(symbol)
@@ -574,11 +663,34 @@ class AltcoinScanner:
         self.book[symbol].ask = float(data.get("a", 0.0))
         self.book[symbol].last_update_ts = time.time()
 
-        await self._alert_spread(symbol)
+    async def _handle_agg_trade(self, data: dict) -> None:
+        symbol = data.get("s", "").upper()
+        if symbol not in self.hot_symbols:
+            return
+
+        price = float(data.get("p", 0.0))
+        qty = float(data.get("q", 0.0))
+        ts = float(data.get("T", 0)) / 1000.0
+        # m=true 表示买方是挂单方 => 主动卖盘; m=false => 主动买盘
+        is_buyer_maker = bool(data.get("m", False))
+        side = "sell" if is_buyer_maker else "buy"
+        notional = price * qty
+
+        event = AggTradeEvent(
+            ts=ts,
+            price=price,
+            qty=qty,
+            notional=notional,
+            side=side,
+        )
+        self.trade_flow[symbol].append(event)
+
+        result = self._detect_large_order_flow(symbol)
+        if result:
+            await self._alert_large_order_flow(symbol, result)
 
     async def _handle_message(self, raw: str) -> None:
         self.runtime.last_message_at = time.time()
-
         payload = json.loads(raw)
 
         if "result" in payload and "id" in payload:
@@ -588,17 +700,20 @@ class AltcoinScanner:
         stream = payload.get("stream", "")
         data = payload.get("data")
 
-        if stream == DISCOVERY_STREAM:
-            if isinstance(data, list):
-                await self._handle_mini_ticker_arr(data)
+        if stream == DISCOVERY_STREAM and isinstance(data, list):
+            await self._handle_mini_ticker_arr(data)
             return
 
         if stream.endswith("@bookTicker"):
             await self._handle_book_ticker(data)
             return
 
+        if stream.endswith("@aggTrade"):
+            await self._handle_agg_trade(data)
+            return
+
     # -------------------------
-    # 定时刷新 universe
+    # 定时刷新
     # -------------------------
 
     async def _periodic_universe_refresh(self) -> None:
@@ -612,7 +727,11 @@ class AltcoinScanner:
 
         invalid_hot = {s for s in self.hot_symbols if s not in self.universe.allowed_symbols}
         if invalid_hot:
-            await self._unsubscribe_streams([f"{s.lower()}@bookTicker" for s in sorted(invalid_hot)])
+            unsub = []
+            for s in sorted(invalid_hot):
+                unsub.append(f"{s.lower()}@bookTicker")
+                unsub.append(f"{s.lower()}@aggTrade")
+            await self._unsubscribe_streams(unsub)
             self.hot_symbols -= invalid_hot
             self.runtime.hot_pool_size = len(self.hot_symbols)
 
@@ -633,9 +752,8 @@ class AltcoinScanner:
         await self.notifier.send(
             "【系统启动成功】\n"
             "山寨币全市场扫描已启动\n"
-            f"计价币种：{QUOTE_ASSET}\n"
-            f"热点池数量：{TOP_N_HOT}\n"
-            f"已屏蔽主流币数量：{len(EXCLUDED_BASE_ASSETS)}"
+            "重点监控：大单推动上涨 / 下跌\n"
+            "已启用：机器人噪音过滤"
         )
 
         await self._run()
