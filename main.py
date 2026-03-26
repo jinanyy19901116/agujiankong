@@ -28,7 +28,7 @@ ENABLE_HEALTHCHECK = os.getenv("ENABLE_HEALTHCHECK", "true").lower() == "true"
 RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "5"))
 
 TELEGRAM_BOT_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
-TELEGRAM_CHAT_ID =  "6308781694"
+TELEGRAM_CHAT_ID = "6308781694"
 
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT").upper()
 DISCOVERY_STREAM = "!miniTicker@arr"
@@ -173,7 +173,7 @@ class BinanceUniverse:
         self.allowed_symbols: Set[str] = set()
         self.spot_symbols: Set[str] = set()
         self.futures_symbols: Set[str] = set()
-        self.futures_source: str = "unknown"  # api / env / unknown
+        self.futures_source: str = "unknown"  # api / env / missing_env / error
 
     async def start(self) -> None:
         if self.session is None:
@@ -231,12 +231,12 @@ class BinanceUniverse:
         if self.session is None:
             await self.start()
 
+        env_symbols = self._load_futures_symbols_from_env()
         url = f"{self.futures_rest_base}/fapi/v1/exchangeInfo"
 
         try:
             async with self.session.get(url) as resp:
                 if resp.status == 451:
-                    env_symbols = self._load_futures_symbols_from_env()
                     if env_symbols:
                         self.futures_source = "env"
                         logging.warning(
@@ -244,16 +244,18 @@ class BinanceUniverse:
                             len(env_symbols),
                         )
                         return env_symbols
-                    raise RuntimeError(
-                        "Futures API 返回 451，且未设置 FUTURES_SYMBOLS 环境变量，无法筛选“有合约的币种”。"
+
+                    self.futures_source = "missing_env"
+                    logging.warning(
+                        "Futures API 返回 451，且未设置 FUTURES_SYMBOLS。当前将返回空集合，程序继续运行。"
                     )
+                    return set()
 
                 resp.raise_for_status()
                 data = await resp.json()
 
         except aiohttp.ClientResponseError as e:
             if e.status == 451:
-                env_symbols = self._load_futures_symbols_from_env()
                 if env_symbols:
                     self.futures_source = "env"
                     logging.warning(
@@ -261,7 +263,26 @@ class BinanceUniverse:
                         len(env_symbols),
                     )
                     return env_symbols
-            raise
+
+                self.futures_source = "missing_env"
+                logging.warning(
+                    "Futures API 返回 451，且未设置 FUTURES_SYMBOLS。当前将返回空集合，程序继续运行。"
+                )
+                return set()
+
+            self.futures_source = "error"
+            logging.exception("获取 Futures 交易对失败")
+            return env_symbols if env_symbols else set()
+
+        except Exception:
+            if env_symbols:
+                self.futures_source = "env"
+                logging.exception("获取 Futures 交易对失败，已改用 FUTURES_SYMBOLS")
+                return env_symbols
+
+            self.futures_source = "error"
+            logging.exception("获取 Futures 交易对失败，且没有 FUTURES_SYMBOLS，返回空集合")
+            return set()
 
         futures_symbols: Set[str] = set()
         for item in data.get("symbols", []):
@@ -704,7 +725,14 @@ class OrderFlowScanner:
         if ENABLE_HEALTHCHECK:
             await self._start_health_server()
 
-        source_text = "Binance Futures API" if self.universe.futures_source == "api" else "环境变量 FUTURES_SYMBOLS"
+        if self.universe.futures_source == "api":
+            source_text = "Binance Futures API"
+        elif self.universe.futures_source == "env":
+            source_text = "环境变量 FUTURES_SYMBOLS"
+        elif self.universe.futures_source == "missing_env":
+            source_text = "未提供 FUTURES_SYMBOLS，当前为空"
+        else:
+            source_text = "未知"
 
         await self.notifier.send(
             "【系统启动成功】\n"
@@ -713,6 +741,14 @@ class OrderFlowScanner:
             "不使用涨跌幅、热度分数\n"
             f"合约币种来源：{source_text}"
         )
+
+        if self.universe.futures_source == "missing_env":
+            await self.notifier.send(
+                "【配置提醒】\n"
+                "Futures API 当前返回 451，且未设置 FUTURES_SYMBOLS。\n"
+                "程序已继续运行，但当前不会监控任何币种。\n"
+                "请在 Railway Variables 中添加 FUTURES_SYMBOLS。"
+            )
 
         await self._run()
 
