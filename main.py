@@ -6,7 +6,7 @@ import signal
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set
 
 import aiohttp
 from aiohttp import web
@@ -18,78 +18,34 @@ from websockets.exceptions import InvalidStatus
 # 配置
 # =========================================================
 
-REST_BASE = os.getenv("REST_BASE", "https://data-api.binance.vision").rstrip("/")
-WS_BASE = os.getenv("WS_BASE", "wss://data-stream.binance.vision/stream?streams=").strip()
 FUTURES_REST_BASE = os.getenv("FUTURES_REST_BASE", "https://fapi.binance.com").rstrip("/")
+FUTURES_WS_BASE = os.getenv("FUTURES_WS_BASE", "wss://fstream.binance.com/stream?streams=").strip()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PORT = int(os.getenv("PORT", "8080"))
 ENABLE_HEALTHCHECK = os.getenv("ENABLE_HEALTHCHECK", "true").lower() == "true"
 RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "5"))
+UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC", "1800"))
 
 TELEGRAM_BOT_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
 TELEGRAM_CHAT_ID =  "6308781694"
 
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT").upper()
-DISCOVERY_STREAM = "!miniTicker@arr"
+TOP_N_FUTURES = int(os.getenv("TOP_N_FUTURES", "50"))
+MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "50000000"))
+ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "60"))
 
-UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC", "1800"))
-TOP_N_SUBSCRIBE = int(os.getenv("TOP_N_SUBSCRIBE", "80"))
-MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "1000000"))
-ALLOW_SPOT_FALLBACK = os.getenv("ALLOW_SPOT_FALLBACK", "true").lower() == "true"
+# ==================== 即时大额市价单监控 ====================
+FLOW_WINDOW_SEC = float(os.getenv("FLOW_WINDOW_SEC", "1.5"))
+FLOW_MIN_TOTAL_NOTIONAL = float(os.getenv("FLOW_MIN_TOTAL_NOTIONAL", "120000"))
+FLOW_MIN_DOMINANCE = float(os.getenv("FLOW_MIN_DOMINANCE", "0.75"))
+FLOW_MIN_TRADE_COUNT = int(os.getenv("FLOW_MIN_TRADE_COUNT", "2"))
+FLOW_SINGLE_LARGE_NOTIONAL = float(os.getenv("FLOW_SINGLE_LARGE_NOTIONAL", "50000"))
 
-EXCLUDED_BASE_ASSETS: Set[str] = {
-    x.strip().upper()
-    for x in os.getenv(
-        "EXCLUDED_BASE_ASSETS",
-        "BTC,ETH,BNB,SOL,XRP,ADA,DOGE,TRX,TON,AVAX,LINK,DOT,LTC,BCH,SHIB,PEPE,XLM,ATOM,UNI,ETC,APT,NEAR,FIL,HBAR,ARB,OP,SUI"
-    ).split(",")
-    if x.strip()
-}
+# 单笔超大单，独立秒推
+SINGLE_PRINT_NOTIONAL = float(os.getenv("SINGLE_PRINT_NOTIONAL", "100000"))
 
-EXCLUDED_SYMBOLS: Set[str] = {
-    x.strip().upper()
-    for x in os.getenv(
-        "EXCLUDED_SYMBOLS",
-        "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,TRXUSDT,TONUSDT"
-    ).split(",")
-    if x.strip()
-}
-
-UPBIT_HOT_SYMBOLS: Set[str] = {
-    x.strip().upper()
-    for x in os.getenv(
-        "UPBIT_HOT_SYMBOLS",
-        (
-            "XRPUSDT,DOGEUSDT,SEIUSDT,SUIUSDT,APTUSDT,ARBUSDT,OPUSDT,"
-            "WLDUSDT,STXUSDT,INJUSDT,RUNEUSDT,IMXUSDT,FETUSDT,GRTUSDT,"
-            "THETAUSDT,AAVEUSDT,NEARUSDT,HBARUSDT,ALGOUSDT,ATOMUSDT,"
-            "TONUSDT,TIAUSDT,JUPUSDT,BLURUSDT,PEOPLEUSDT,ARKMUSDT,"
-            "WIFUSDT,ORDIUSDT,SATSUSDT,1000PEPEUSDT,1000BONKUSDT,"
-            "ENAUSDT,NOTUSDT,TURBOUSDT,MEMEUSDT,BOMEUSDT,AEVOUSDT,"
-            "IDUSDT,AIUSDT,PORTALUSDT,STRKUSDT,PIXELUSDT,BEAMXUSDT,"
-            "CFXUSDT,ROSEUSDT,CELOUSDT,ANKRUSDT,SKLUSDT,API3USDT,"
-            "MINAUSDT,ASTRUSDT,KAVAUSDT,ZILUSDT,ICXUSDT,ONEUSDT"
-        )
-    ).split(",")
-    if x.strip()
-}
-
-ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "180"))
-
-# ==================== 趋势确认 ====================
-TREND_CONFIRM_WINDOW_SEC = float(os.getenv("TREND_CONFIRM_WINDOW_SEC", "4.0"))
-TREND_CONFIRM_MIN_NOTIONAL = float(os.getenv("TREND_CONFIRM_MIN_NOTIONAL", "220000"))
-TREND_CONFIRM_MIN_DOMINANCE = float(os.getenv("TREND_CONFIRM_MIN_DOMINANCE", "0.72"))
-TREND_CONFIRM_MIN_MOVE_PCT = float(os.getenv("TREND_CONFIRM_MIN_MOVE_PCT", "0.18"))
-TREND_CONFIRM_MIN_IMBALANCE = float(os.getenv("TREND_CONFIRM_MIN_IMBALANCE", "0.12"))
-TREND_CONFIRM_MIN_TRADE_COUNT = int(os.getenv("TREND_CONFIRM_MIN_TRADE_COUNT", "3"))
-
-# ==================== 盘口 ====================
-IMBALANCE_WINDOW_SEC = float(os.getenv("IMBALANCE_WINDOW_SEC", "2.0"))
-MIN_BOOK_SNAPSHOT_FOR_IMBALANCE = int(os.getenv("MIN_BOOK_SNAPSHOT_FOR_IMBALANCE", "3"))
-
-# ==================== 噪音过滤 ====================
+# 机器人噪音过滤
 BOT_MAX_MICRO_NOTIONAL = float(os.getenv("BOT_MAX_MICRO_NOTIONAL", "3000"))
 BOT_ALTERNATING_COUNT = int(os.getenv("BOT_ALTERNATING_COUNT", "8"))
 BOT_BURST_WINDOW_SEC = float(os.getenv("BOT_BURST_WINDOW_SEC", "2.0"))
@@ -98,29 +54,6 @@ BOT_BURST_WINDOW_SEC = float(os.getenv("BOT_BURST_WINDOW_SEC", "2.0"))
 # =========================================================
 # 数据结构
 # =========================================================
-
-@dataclass
-class MiniTickerState:
-    symbol: str
-    last_price: float = 0.0
-    quote_volume_24h: float = 0.0
-    last_update_ts: float = 0.0
-
-
-@dataclass
-class BookTickerSnapshot:
-    ts: float
-    bid: float
-    ask: float
-    bid_qty: float
-    ask_qty: float
-
-    @property
-    def mid(self) -> float:
-        if self.bid > 0 and self.ask > 0:
-            return (self.bid + self.ask) / 2.0
-        return max(self.bid, self.ask, 0.0)
-
 
 @dataclass
 class AggTradeEvent:
@@ -187,19 +120,17 @@ class TelegramNotifier:
 
 
 # =========================================================
-# Universe
+# Futures Universe（纯合约）
 # =========================================================
 
-class BinanceUniverse:
-    def __init__(self, rest_base: str, futures_rest_base: str):
-        self.rest_base = rest_base
+class FuturesUniverse:
+    def __init__(self, futures_rest_base: str):
         self.futures_rest_base = futures_rest_base
         self.session: Optional[aiohttp.ClientSession] = None
+
+        self.all_symbols: Set[str] = set()
         self.allowed_symbols: Set[str] = set()
-        self.spot_symbols: Set[str] = set()
-        self.futures_symbols: Set[str] = set()
-        self.futures_source: str = "unknown"   # api / env / missing_env / error
-        self.monitor_mode: str = "unknown"     # futures_intersection / spot_fallback / empty
+        self.source: str = "unknown"  # api / env / missing_env / error
 
     async def start(self) -> None:
         if self.session is None:
@@ -211,47 +142,13 @@ class BinanceUniverse:
             await self.session.close()
             self.session = None
 
-    async def _fetch_spot_symbols(self) -> Set[str]:
-        if self.session is None:
-            await self.start()
-
-        url = f"{self.rest_base}/api/v3/exchangeInfo?permissions=SPOT&symbolStatus=TRADING"
-        async with self.session.get(url) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-
-        allowed: Set[str] = set()
-        for item in data.get("symbols", []):
-            if not isinstance(item, dict):
-                continue
-
-            symbol = item.get("symbol", "").upper()
-            status = item.get("status", "")
-            quote_asset = item.get("quoteAsset", "").upper()
-            base_asset = item.get("baseAsset", "").upper()
-            is_spot = bool(item.get("isSpotTradingAllowed", False))
-
-            if status != "TRADING":
-                continue
-            if quote_asset != QUOTE_ASSET:
-                continue
-            if not is_spot:
-                continue
-            if base_asset in EXCLUDED_BASE_ASSETS:
-                continue
-            if symbol in EXCLUDED_SYMBOLS:
-                continue
-
-            allowed.add(symbol)
-        return allowed
-
     def _load_futures_symbols_from_env(self) -> Set[str]:
         raw = os.getenv("FUTURES_SYMBOLS", "").strip()
         if not raw:
             return set()
         return {s.strip().upper() for s in raw.split(",") if s.strip()}
 
-    async def _fetch_usdm_futures_symbols(self) -> Set[str]:
+    async def _fetch_futures_exchange_info(self) -> Set[str]:
         if self.session is None:
             await self.start()
 
@@ -264,20 +161,20 @@ class BinanceUniverse:
 
                 if resp.status == 451:
                     if env_symbols:
-                        self.futures_source = "env"
+                        self.source = "env"
                         logging.info("期货API返回451，已改用 FUTURES_SYMBOLS，共 %s 个币种", len(env_symbols))
                         return env_symbols
 
-                    self.futures_source = "missing_env"
-                    logging.info("期货API返回451，未设置FUTURES_SYMBOLS，当前可切到spot_fallback。")
+                    self.source = "missing_env"
+                    logging.warning("期货API返回451，且未设置 FUTURES_SYMBOLS。纯合约模式下当前无法监控。")
                     return set()
 
                 if resp.status != 200:
-                    self.futures_source = "error"
-                    logging.warning("Futures API 返回非200: status=%s body=%s", resp.status, text[:300])
+                    self.source = "error"
+                    logging.warning("Futures exchangeInfo 非200: status=%s body=%s", resp.status, text[:300])
 
                     if env_symbols:
-                        self.futures_source = "env"
+                        self.source = "env"
                         logging.info("已改用 FUTURES_SYMBOLS，共 %s 个币种", len(env_symbols))
                         return env_symbols
 
@@ -286,11 +183,11 @@ class BinanceUniverse:
                 try:
                     data = json.loads(text)
                 except json.JSONDecodeError:
-                    self.futures_source = "error"
-                    logging.warning("Futures API 返回的不是JSON: %s", text[:300])
+                    self.source = "error"
+                    logging.warning("Futures exchangeInfo 返回的不是JSON: %s", text[:300])
 
                     if env_symbols:
-                        self.futures_source = "env"
+                        self.source = "env"
                         logging.info("已改用 FUTURES_SYMBOLS，共 %s 个币种", len(env_symbols))
                         return env_symbols
 
@@ -298,15 +195,15 @@ class BinanceUniverse:
 
         except Exception:
             if env_symbols:
-                self.futures_source = "env"
-                logging.exception("获取 Futures 交易对失败，已改用 FUTURES_SYMBOLS")
+                self.source = "env"
+                logging.exception("获取 Futures exchangeInfo 失败，已改用 FUTURES_SYMBOLS")
                 return env_symbols
 
-            self.futures_source = "error"
-            logging.exception("获取 Futures 交易对失败，且没有 FUTURES_SYMBOLS，返回空集合")
+            self.source = "error"
+            logging.exception("获取 Futures exchangeInfo 失败，且没有 FUTURES_SYMBOLS")
             return set()
 
-        futures_symbols: Set[str] = set()
+        symbols: Set[str] = set()
         for item in data.get("symbols", []):
             if not isinstance(item, dict):
                 continue
@@ -314,64 +211,113 @@ class BinanceUniverse:
             symbol = item.get("symbol", "").upper()
             status = item.get("status", "")
             quote_asset = item.get("quoteAsset", "").upper()
+            contract_type = item.get("contractType", "")
 
             if status != "TRADING":
                 continue
             if quote_asset != QUOTE_ASSET:
                 continue
+            if contract_type != "PERPETUAL":
+                continue
 
-            futures_symbols.add(symbol)
+            symbols.add(symbol)
 
-        self.futures_source = "api"
-        return futures_symbols
+        self.source = "api"
+        return symbols
+
+    async def _fetch_futures_24h_tickers(self) -> List[dict]:
+        if self.session is None:
+            await self.start()
+
+        url = f"{self.futures_rest_base}/fapi/v1/ticker/24hr"
+        try:
+            async with self.session.get(url) as resp:
+                text = await resp.text()
+
+                if resp.status != 200:
+                    logging.warning("Futures 24hr 非200: status=%s body=%s", resp.status, text[:300])
+                    return []
+
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    logging.warning("Futures 24hr 返回的不是JSON: %s", text[:300])
+                    return []
+
+                return data if isinstance(data, list) else []
+        except Exception:
+            logging.exception("获取 Futures 24hr 数据失败")
+            return []
 
     async def refresh(self) -> None:
         if self.session is None:
             await self.start()
 
-        spot_symbols, futures_symbols = await asyncio.gather(
-            self._fetch_spot_symbols(),
-            self._fetch_usdm_futures_symbols(),
-        )
+        symbols = await self._fetch_futures_exchange_info()
+        self.all_symbols = symbols
 
-        self.spot_symbols = spot_symbols
-        self.futures_symbols = futures_symbols
-
-        if futures_symbols:
-            self.allowed_symbols = (spot_symbols & futures_symbols) & UPBIT_HOT_SYMBOLS
-            self.monitor_mode = "futures_intersection"
-        elif ALLOW_SPOT_FALLBACK:
-            self.allowed_symbols = spot_symbols & UPBIT_HOT_SYMBOLS
-            self.monitor_mode = "spot_fallback"
-        else:
+        if not symbols:
             self.allowed_symbols = set()
-            self.monitor_mode = "empty"
+            logging.warning("纯合约模式：当前可监控合约为空，source=%s", self.source)
+            return
+
+        tickers = await self._fetch_futures_24h_tickers()
+        if not tickers:
+            self.allowed_symbols = set(sorted(symbols)[:TOP_N_FUTURES])
+            logging.info(
+                "纯合约交易池刷新完成：全部合约=%s，24h排行不可用，退化使用前%s个，最终=%s，来源=%s",
+                len(symbols),
+                TOP_N_FUTURES,
+                len(self.allowed_symbols),
+                self.source,
+            )
+            return
+
+        ranked = []
+        for item in tickers:
+            if not isinstance(item, dict):
+                continue
+
+            symbol = item.get("symbol", "").upper()
+            if symbol not in symbols:
+                continue
+
+            try:
+                quote_volume = float(item.get("quoteVolume", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+
+            if quote_volume < MIN_24H_QUOTE_VOLUME:
+                continue
+
+            ranked.append((symbol, quote_volume))
+
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        self.allowed_symbols = {s for s, _ in ranked[:TOP_N_FUTURES]}
+
+        if not self.allowed_symbols:
+            self.allowed_symbols = set(sorted(symbols)[:TOP_N_FUTURES])
 
         logging.info(
-            "交易池刷新完成：现货山寨币=%s，合约符号种类=%s，Upbit白名单=%s，最终可监控=%s，合约来源=%s，监控模式=%s",
-            len(spot_symbols),
-            len(futures_symbols),
-            len(UPBIT_HOT_SYMBOLS),
+            "纯合约交易池刷新完成：全部合约=%s，24h达标=%s，最终订阅=%s，来源=%s",
+            len(symbols),
+            len(ranked),
             len(self.allowed_symbols),
-            self.futures_source,
-            self.monitor_mode,
+            self.source,
         )
 
 
 # =========================================================
-# Scanner
+# Scanner（纯合约即时主动成交）
 # =========================================================
 
-class OrderFlowScanner:
+class FuturesOrderFlowScanner:
     def __init__(self):
         self.runtime = RuntimeStatus()
-        self.universe = BinanceUniverse(REST_BASE, FUTURES_REST_BASE)
+        self.universe = FuturesUniverse(FUTURES_REST_BASE)
         self.notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
-        self.market: Dict[str, MiniTickerState] = {}
-        self.trade_flow: Dict[str, Deque[AggTradeEvent]] = defaultdict(lambda: deque(maxlen=4000))
-        self.book_flow: Dict[str, Deque[BookTickerSnapshot]] = defaultdict(lambda: deque(maxlen=500))
-
+        self.trade_flow: Dict[str, Deque[AggTradeEvent]] = defaultdict(lambda: deque(maxlen=5000))
         self.active_symbols: Set[str] = set()
         self.last_alert_at: Dict[str, float] = defaultdict(float)
 
@@ -400,54 +346,34 @@ class OrderFlowScanner:
         sides = [e.side for e in recent]
         alternating = sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1])
         span = recent[-1].ts - recent[0].ts
-
         return alternating >= BOT_ALTERNATING_COUNT - 1 and span <= BOT_BURST_WINDOW_SEC
 
     def _get_trade_window(self, symbol: str, sec: float) -> List[AggTradeEvent]:
         now = time.time()
         dq = self.trade_flow[symbol]
         cutoff = now - max(sec, 10.0)
+
         while dq and dq[0].ts < cutoff:
             dq.popleft()
+
         return [x for x in dq if x.ts >= now - sec]
 
-    def _get_book_window(self, symbol: str, sec: float) -> List[BookTickerSnapshot]:
-        now = time.time()
-        dq = self.book_flow[symbol]
-        cutoff = now - max(sec, 10.0)
-        while dq and dq[0].ts < cutoff:
-            dq.popleft()
-        return [x for x in dq if x.ts >= now - sec]
-
-    @staticmethod
-    def _pct_change(a: float, b: float) -> float:
-        if a <= 0:
-            return 0.0
-        return (b - a) / a * 100.0
-
-    def _book_imbalance(self, symbol: str, sec: float = IMBALANCE_WINDOW_SEC) -> float:
-        books = self._get_book_window(symbol, sec)
-        if len(books) < MIN_BOOK_SNAPSHOT_FOR_IMBALANCE:
-            return 0.0
-
-        vals: List[float] = []
-        for b in books:
-            denom = b.bid_qty + b.ask_qty
-            if denom <= 0:
-                continue
-            vals.append((b.bid_qty - b.ask_qty) / denom)
-
-        if not vals:
-            return 0.0
-        return sum(vals) / len(vals)
-
-    def _detect_trend_confirmation(self, symbol: str) -> Optional[dict]:
-        events = self._get_trade_window(symbol, TREND_CONFIRM_WINDOW_SEC)
-        books = self._get_book_window(symbol, TREND_CONFIRM_WINDOW_SEC)
-
-        if len(events) < TREND_CONFIRM_MIN_TRADE_COUNT:
+    def _detect_single_large_market_order(self, symbol: str, event: AggTradeEvent) -> Optional[dict]:
+        if event.notional < SINGLE_PRINT_NOTIONAL:
             return None
-        if len(books) < MIN_BOOK_SNAPSHOT_FOR_IMBALANCE:
+
+        return {
+            "type": "single_buy" if event.side == "buy" else "single_sell",
+            "price": event.price,
+            "qty": event.qty,
+            "notional": event.notional,
+            "side": event.side,
+        }
+
+    def _detect_aggressive_cluster(self, symbol: str) -> Optional[dict]:
+        events = self._get_trade_window(symbol, FLOW_WINDOW_SEC)
+
+        if len(events) < FLOW_MIN_TRADE_COUNT:
             return None
         if self._is_bot_noise(events):
             return None
@@ -455,69 +381,79 @@ class OrderFlowScanner:
         buy_notional = sum(e.notional for e in events if e.side == "buy")
         sell_notional = sum(e.notional for e in events if e.side == "sell")
         total_notional = buy_notional + sell_notional
-        if total_notional < TREND_CONFIRM_MIN_NOTIONAL:
+
+        if total_notional < FLOW_MIN_TOTAL_NOTIONAL:
             return None
 
-        side = "buy" if buy_notional >= sell_notional else "sell"
-        dominance = max(buy_notional, sell_notional) / total_notional
-        if dominance < TREND_CONFIRM_MIN_DOMINANCE:
+        dominant_side = "buy" if buy_notional >= sell_notional else "sell"
+        dominant_notional = max(buy_notional, sell_notional)
+        dominance = dominant_notional / total_notional if total_notional > 0 else 0.0
+
+        if dominance < FLOW_MIN_DOMINANCE:
+            return None
+
+        max_single = max(e.notional for e in events)
+        if max_single < FLOW_SINGLE_LARGE_NOTIONAL:
             return None
 
         start_price = events[0].price
         end_price = events[-1].price
-        move_pct = self._pct_change(start_price, end_price)
-        imbalance = self._book_imbalance(symbol, TREND_CONFIRM_WINDOW_SEC)
 
-        if side == "buy":
-            if move_pct >= TREND_CONFIRM_MIN_MOVE_PCT and imbalance >= TREND_CONFIRM_MIN_IMBALANCE:
-                return {
-                    "type": "bull_trend_confirmation",
-                    "total_notional": total_notional,
-                    "dominance": dominance,
-                    "move_pct": move_pct,
-                    "imbalance": imbalance,
-                    "start_price": start_price,
-                    "end_price": end_price,
-                    "trade_count": len(events),
-                }
+        return {
+            "type": "cluster_buy" if dominant_side == "buy" else "cluster_sell",
+            "side": dominant_side,
+            "total_notional": total_notional,
+            "dominance": dominance,
+            "max_single": max_single,
+            "trade_count": len(events),
+            "start_price": start_price,
+            "end_price": end_price,
+        }
+
+    async def _alert_single_large_market_order(self, symbol: str, result: dict) -> None:
+        if result["type"] == "single_buy":
+            title = "【超大市价买单】"
+            action = "关注上冲"
+            desc = "出现单笔超大主动买盘"
         else:
-            if move_pct <= -TREND_CONFIRM_MIN_MOVE_PCT and imbalance <= -TREND_CONFIRM_MIN_IMBALANCE:
-                return {
-                    "type": "bear_trend_confirmation",
-                    "total_notional": total_notional,
-                    "dominance": dominance,
-                    "move_pct": move_pct,
-                    "imbalance": imbalance,
-                    "start_price": start_price,
-                    "end_price": end_price,
-                    "trade_count": len(events),
-                }
-
-        return None
-
-    async def _alert_trend_confirmation(self, symbol: str, result: dict) -> None:
-        if result["type"] == "bull_trend_confirmation":
-            title = "【上涨确认】"
-            suggestion = "买入"
-            desc = "主动买盘推动价格上行，且盘口买盘占优"
-        else:
-            title = "【下跌确认】"
-            suggestion = "卖出"
-            desc = "主动卖盘推动价格下行，且盘口卖盘占优"
+            title = "【超大市价卖单】"
+            action = "关注下砸"
+            desc = "出现单笔超大主动卖盘"
 
         msg = (
             f"{title}\n"
-            f"币种：{symbol}\n"
-            f"操作建议：{suggestion}\n"
-            f"确认原因：{desc}\n\n"
-            f"总成交额：{result['total_notional']:,.0f} {QUOTE_ASSET}\n"
+            f"合约：{symbol}\n"
+            f"即时判断：{action}\n"
+            f"原因：{desc}\n\n"
+            f"成交额：{result['notional']:,.0f} {QUOTE_ASSET}\n"
+            f"成交数量：{result['qty']}\n"
+            f"成交价格：{result['price']}"
+        )
+        await self._maybe_alert(f"single:{symbol}:{result['type']}", msg)
+
+    async def _alert_aggressive_cluster(self, symbol: str, result: dict) -> None:
+        if result["type"] == "cluster_buy":
+            title = "【大额市价买盘涌入】"
+            action = "关注拉升"
+            desc = "短时内主动买盘主导，可能推动价格继续上冲"
+        else:
+            title = "【大额市价卖盘涌入】"
+            action = "关注下跌"
+            desc = "短时内主动卖盘主导，可能推动价格继续下压"
+
+        msg = (
+            f"{title}\n"
+            f"合约：{symbol}\n"
+            f"即时判断：{action}\n"
+            f"原因：{desc}\n\n"
+            f"窗口时长：{FLOW_WINDOW_SEC:.1f}s\n"
+            f"总主动成交额：{result['total_notional']:,.0f} {QUOTE_ASSET}\n"
             f"主导占比：{result['dominance'] * 100:.1f}%\n"
-            f"价格变化：{result['move_pct']:.3f}%\n"
-            f"盘口偏向：{result['imbalance']:.3f}\n"
+            f"最大单笔：{result['max_single']:,.0f} {QUOTE_ASSET}\n"
             f"成交笔数：{result['trade_count']}\n"
             f"价格区间：{result['start_price']} -> {result['end_price']}"
         )
-        await self._maybe_alert(f"trend:{symbol}:{result['type']}", msg)
+        await self._maybe_alert(f"cluster:{symbol}:{result['type']}", msg)
 
     async def _health(self, request: web.Request) -> web.Response:
         now = time.time()
@@ -530,15 +466,12 @@ class OrderFlowScanner:
             "reconnect_count": self.runtime.reconnect_count,
             "universe_size": self.runtime.universe_size,
             "subscribed_count": self.runtime.subscribed_count,
-            "spot_symbol_count": len(self.universe.spot_symbols),
-            "futures_symbol_count": len(self.universe.futures_symbols),
-            "futures_source": self.universe.futures_source,
-            "monitor_mode": self.universe.monitor_mode,
+            "futures_source": self.universe.source,
             "last_error": self.runtime.last_error,
         })
 
     async def _root(self, request: web.Request) -> web.Response:
-        return web.Response(text="order-flow scanner is running")
+        return web.Response(text="futures aggressive scanner is running")
 
     async def _start_health_server(self) -> None:
         app = web.Application()
@@ -580,88 +513,24 @@ class OrderFlowScanner:
             else:
                 logging.info("WebSocket 控制响应: %s", payload)
 
-    def _reselect_active_symbols(self) -> Tuple[Set[str], Set[str]]:
-        ranked = sorted(
-            (
-                s for s, st in self.market.items()
-                if s in self.universe.allowed_symbols and st.quote_volume_24h >= MIN_24H_QUOTE_VOLUME
-            ),
-            key=lambda x: self.market[x].quote_volume_24h,
-            reverse=True
-        )
+    async def _refresh_active_symbols(self) -> None:
+        await self.universe.refresh()
+        self.runtime.universe_size = len(self.universe.allowed_symbols)
 
-        next_set = set(ranked[:TOP_N_SUBSCRIBE])
+        next_set = set(sorted(self.universe.allowed_symbols))
         added = next_set - self.active_symbols
         removed = self.active_symbols - next_set
-        self.active_symbols = next_set
-        self.runtime.subscribed_count = len(self.active_symbols)
-        return added, removed
 
-    async def _handle_mini_ticker_arr(self, arr: list) -> None:
-        now = time.time()
-
-        for item in arr:
-            if not isinstance(item, dict):
-                continue
-
-            symbol = item.get("s", "").upper()
-            if symbol not in self.universe.allowed_symbols:
-                continue
-
-            st = self.market.get(symbol)
-            if st is None:
-                st = MiniTickerState(symbol=symbol)
-                self.market[symbol] = st
-
-            try:
-                st.last_price = float(item.get("c", 0.0) or 0.0)
-                st.quote_volume_24h = float(item.get("q", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                continue
-
-            st.last_update_ts = now
-
-        added, removed = self._reselect_active_symbols()
-
-        unsub = []
-        sub = []
-
-        for s in sorted(removed):
-            unsub.append(f"{s.lower()}@aggTrade")
-            unsub.append(f"{s.lower()}@bookTicker")
-
-        for s in sorted(added):
-            sub.append(f"{s.lower()}@aggTrade")
-            sub.append(f"{s.lower()}@bookTicker")
+        unsub = [f"{s.lower()}@aggTrade" for s in sorted(removed)]
+        sub = [f"{s.lower()}@aggTrade" for s in sorted(added)]
 
         if unsub:
             await self._unsubscribe_streams(unsub)
         if sub:
             await self._subscribe_streams(sub)
 
-    async def _handle_book_ticker(self, data: dict) -> None:
-        if not isinstance(data, dict):
-            return
-
-        symbol = data.get("s", "").upper()
-        if symbol not in self.active_symbols:
-            return
-
-        try:
-            snap = BookTickerSnapshot(
-                ts=time.time(),
-                bid=float(data.get("b", 0.0) or 0.0),
-                ask=float(data.get("a", 0.0) or 0.0),
-                bid_qty=float(data.get("B", 0.0) or 0.0),
-                ask_qty=float(data.get("A", 0.0) or 0.0),
-            )
-        except (TypeError, ValueError):
-            return
-
-        if snap.bid <= 0 and snap.ask <= 0:
-            return
-
-        self.book_flow[symbol].append(snap)
+        self.active_symbols = next_set
+        self.runtime.subscribed_count = len(self.active_symbols)
 
     async def _handle_agg_trade(self, data: dict) -> None:
         if not isinstance(data, dict):
@@ -682,6 +551,8 @@ class OrderFlowScanner:
             return
 
         notional = price * qty
+
+        # m=true => buyer is maker => taker sell（主动卖）
         is_buyer_maker = bool(data.get("m", False))
         side = "sell" if is_buyer_maker else "buy"
 
@@ -694,9 +565,13 @@ class OrderFlowScanner:
         )
         self.trade_flow[symbol].append(event)
 
-        trend = self._detect_trend_confirmation(symbol)
-        if trend:
-            await self._alert_trend_confirmation(symbol, trend)
+        single_result = self._detect_single_large_market_order(symbol, event)
+        if single_result:
+            await self._alert_single_large_market_order(symbol, single_result)
+
+        cluster_result = self._detect_aggressive_cluster(symbol)
+        if cluster_result:
+            await self._alert_aggressive_cluster(symbol, cluster_result)
 
     async def _handle_message(self, raw: str) -> None:
         self.runtime.last_message_at = time.time()
@@ -717,17 +592,8 @@ class OrderFlowScanner:
         stream = payload.get("stream", "")
         data = payload.get("data")
 
-        if stream == DISCOVERY_STREAM and isinstance(data, list):
-            await self._handle_mini_ticker_arr(data)
-            return
-
         if isinstance(stream, str) and stream.endswith("@aggTrade"):
             await self._handle_agg_trade(data)
-            return
-
-        if isinstance(stream, str) and stream.endswith("@bookTicker"):
-            await self._handle_book_ticker(data)
-            return
 
     async def _periodic_universe_refresh(self) -> None:
         now = time.time()
@@ -735,61 +601,41 @@ class OrderFlowScanner:
             return
 
         self._last_universe_refresh = now
-        await self.universe.refresh()
-        self.runtime.universe_size = len(self.universe.allowed_symbols)
-
-        invalid_active = {s for s in self.active_symbols if s not in self.universe.allowed_symbols}
-        if invalid_active:
-            unsub = []
-            for s in sorted(invalid_active):
-                unsub.append(f"{s.lower()}@aggTrade")
-                unsub.append(f"{s.lower()}@bookTicker")
-            await self._unsubscribe_streams(unsub)
-            self.active_symbols -= invalid_active
-            self.runtime.subscribed_count = len(self.active_symbols)
+        await self._refresh_active_symbols()
 
     async def start(self) -> None:
         await self.universe.start()
+        await self.notifier.start()
+
         await self.universe.refresh()
         self.runtime.universe_size = len(self.universe.allowed_symbols)
         self._last_universe_refresh = time.time()
 
-        await self.notifier.start()
-
         if ENABLE_HEALTHCHECK:
             await self._start_health_server()
 
-        if self.universe.futures_source == "api":
-            source_text = "Binance Futures API"
-        elif self.universe.futures_source == "env":
-            source_text = "环境变量 FUTURES_SYMBOLS"
-        elif self.universe.futures_source == "missing_env":
-            source_text = "未提供 FUTURES_SYMBOLS"
-        elif self.universe.futures_source == "error":
-            source_text = "Futures 获取失败"
-        else:
-            source_text = "未知"
-
-        if self.universe.monitor_mode == "futures_intersection":
-            mode_text = "仅监控有 USDⓈ-M 合约且在 Upbit 白名单中的币种"
-        elif self.universe.monitor_mode == "spot_fallback":
-            mode_text = "Futures 不可用，已退回现货白名单监控模式"
-        else:
-            mode_text = "当前监控池为空"
+        source_map = {
+            "api": "Binance Futures API",
+            "env": "环境变量 FUTURES_SYMBOLS",
+            "missing_env": "未提供 FUTURES_SYMBOLS",
+            "error": "Futures 获取失败",
+        }
+        source_text = source_map.get(self.universe.source, "未知")
 
         await self.notifier.send(
             "【系统启动成功】\n"
-            f"{mode_text}\n"
-            "监控内容：仅推送确认后的上涨 / 下跌信号\n"
-            f"合约币种来源：{source_text}"
+            "模式：纯合约即时主动成交监控\n"
+            "仅推送：超大市价单 / 短时大额主动买卖簇\n"
+            f"当前合约数量：{len(self.universe.allowed_symbols)}\n"
+            f"合约来源：{source_text}"
         )
 
-        if self.universe.monitor_mode == "empty":
+        if not self.universe.allowed_symbols:
             await self.notifier.send(
                 "【配置提醒】\n"
-                "当前没有可监控币种。\n"
-                "如 Futures API 返回 451，请设置 FUTURES_SYMBOLS，"
-                "或将 ALLOW_SPOT_FALLBACK=true。"
+                "当前没有可监控合约。\n"
+                "如果 Futures API 返回 451，请设置 FUTURES_SYMBOLS，"
+                "或者更换可访问 Binance Futures 的网络/IP。"
             )
 
         await self._run()
@@ -804,15 +650,14 @@ class OrderFlowScanner:
             self.health_runner = None
 
     async def _run(self) -> None:
-        ws_url = WS_BASE + DISCOVERY_STREAM
-        self.runtime.ws_url = ws_url
+        self.runtime.ws_url = FUTURES_WS_BASE
 
         while not self._stop_event.is_set():
             try:
-                logging.info("正在连接 %s", ws_url)
+                logging.info("正在连接 Futures WebSocket")
 
                 async with websockets.connect(
-                    ws_url,
+                    FUTURES_WS_BASE + "btcusdt@aggTrade",
                     ping_interval=20,
                     ping_timeout=20,
                     close_timeout=10,
@@ -821,7 +666,10 @@ class OrderFlowScanner:
                     self.ws = ws
                     self.runtime.connected = True
                     self.runtime.last_error = ""
-                    logging.info("WebSocket 已连接")
+                    logging.info("Futures WebSocket 已连接")
+
+                    await self._unsubscribe_streams(["btcusdt@aggTrade"])
+                    await self._refresh_active_symbols()
 
                     while not self._stop_event.is_set():
                         try:
@@ -837,7 +685,7 @@ class OrderFlowScanner:
                 self.runtime.reconnect_count += 1
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 self.runtime.last_error = f"InvalidStatus: {code}"
-                logging.exception("WebSocket 握手失败")
+                logging.exception("Futures WebSocket 握手失败")
                 await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
             except asyncio.CancelledError:
@@ -847,7 +695,7 @@ class OrderFlowScanner:
                 self.runtime.connected = False
                 self.runtime.reconnect_count += 1
                 self.runtime.last_error = repr(e)
-                logging.exception("WebSocket 连接中断")
+                logging.exception("Futures WebSocket 连接中断")
                 await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
             finally:
@@ -867,7 +715,7 @@ def setup_logging() -> None:
 
 async def main() -> None:
     setup_logging()
-    scanner = OrderFlowScanner()
+    scanner = FuturesOrderFlowScanner()
     loop = asyncio.get_running_loop()
 
     def _shutdown() -> None:
