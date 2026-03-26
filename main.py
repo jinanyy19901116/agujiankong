@@ -20,7 +20,7 @@ from websockets.exceptions import InvalidStatus
 
 REST_BASE = os.getenv("REST_BASE", "https://data-api.binance.vision").rstrip("/")
 WS_BASE = os.getenv("WS_BASE", "wss://data-stream.binance.vision/stream?streams=").strip()
-FUTURES_REST_BASE =   "https://fapi1.binance.com"
+FUTURES_REST_BASE = os.getenv("FUTURES_REST_BASE", "https://fapi.binance.com").rstrip("/")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PORT = int(os.getenv("PORT", "8080"))
@@ -28,7 +28,7 @@ ENABLE_HEALTHCHECK = os.getenv("ENABLE_HEALTHCHECK", "true").lower() == "true"
 RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "5"))
 
 TELEGRAM_BOT_TOKEN = "8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnkMCK5FM"
-TELEGRAM_CHAT_ID = "6308781694"
+TELEGRAM_CHAT_ID =  "6308781694"
 
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT").upper()
 DISCOVERY_STREAM = "!miniTicker@arr"
@@ -260,6 +260,8 @@ class BinanceUniverse:
 
         try:
             async with self.session.get(url) as resp:
+                text = await resp.text()
+
                 if resp.status == 451:
                     if env_symbols:
                         self.futures_source = "env"
@@ -267,26 +269,32 @@ class BinanceUniverse:
                         return env_symbols
 
                     self.futures_source = "missing_env"
-                    logging.info("期货API返回451，未设置FUTURES_SYMBOLS，当前可切到 spot_fallback。")
+                    logging.info("期货API返回451，未设置FUTURES_SYMBOLS，当前可切到spot_fallback。")
                     return set()
 
-                resp.raise_for_status()
-                data = await resp.json()
+                if resp.status != 200:
+                    self.futures_source = "error"
+                    logging.warning("Futures API 返回非200: status=%s body=%s", resp.status, text[:300])
 
-        except aiohttp.ClientResponseError as e:
-            if e.status == 451:
-                if env_symbols:
-                    self.futures_source = "env"
-                    logging.info("期货API返回451，已改用 FUTURES_SYMBOLS，共 %s 个币种", len(env_symbols))
-                    return env_symbols
+                    if env_symbols:
+                        self.futures_source = "env"
+                        logging.info("已改用 FUTURES_SYMBOLS，共 %s 个币种", len(env_symbols))
+                        return env_symbols
 
-                self.futures_source = "missing_env"
-                logging.info("期货API返回451，未设置FUTURES_SYMBOLS，当前可切到 spot_fallback。")
-                return set()
+                    return set()
 
-            self.futures_source = "error"
-            logging.exception("获取 Futures 交易对失败")
-            return env_symbols if env_symbols else set()
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    self.futures_source = "error"
+                    logging.warning("Futures API 返回的不是JSON: %s", text[:300])
+
+                    if env_symbols:
+                        self.futures_source = "env"
+                        logging.info("已改用 FUTURES_SYMBOLS，共 %s 个币种", len(env_symbols))
+                        return env_symbols
+
+                    return set()
 
         except Exception:
             if env_symbols:
@@ -686,7 +694,6 @@ class OrderFlowScanner:
         )
         self.trade_flow[symbol].append(event)
 
-        # 只推送确认后的趋势信号
         trend = self._detect_trend_confirmation(symbol)
         if trend:
             await self._alert_trend_confirmation(symbol, trend)
