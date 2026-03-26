@@ -20,7 +20,7 @@ from websockets.exceptions import InvalidStatus
 
 REST_BASE = os.getenv("REST_BASE", "https://data-api.binance.vision").rstrip("/")
 WS_BASE = os.getenv("WS_BASE", "wss://data-stream.binance.vision/stream?streams=").strip()
-FUTURES_REST_BASE =  "https://fapi.binance.com").rstrip("/")
+FUTURES_REST_BASE =   "https://fapi1.binance.com"
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PORT = int(os.getenv("PORT", "8080"))
