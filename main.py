@@ -20,7 +20,6 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 # =========================================================
 
 FUTURES_REST_BASE = os.getenv("FUTURES_REST_BASE", "https://fapi.binance.com").rstrip("/")
-# 改为基地址，连接时直接使用 /ws，不再使用占位 stream
 FUTURES_WS_ORIGIN = os.getenv("FUTURES_WS_ORIGIN", "wss://fstream.binance.com").rstrip("/")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -38,7 +37,6 @@ TOP_N_FUTURES = int(os.getenv("TOP_N_FUTURES", "20"))
 MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "20000000"))
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "60"))
 
-# 内置默认合约列表：即使环境变量没配也能跑
 DEFAULT_FUTURES_SYMBOLS = [
     "JSTUSDT",
     "ONTUSDT",
@@ -69,7 +67,6 @@ FLOW_MIN_TRADE_COUNT = int(os.getenv("FLOW_MIN_TRADE_COUNT", "2"))
 FLOW_SINGLE_LARGE_NOTIONAL = float(os.getenv("FLOW_SINGLE_LARGE_NOTIONAL", "40000"))
 FLOW_BALANCE_NOISE_MAX_DOMINANCE = float(os.getenv("FLOW_BALANCE_NOISE_MAX_DOMINANCE", "0.58"))
 
-# 单笔超大单，独立秒推
 SINGLE_PRINT_NOTIONAL = float(os.getenv("SINGLE_PRINT_NOTIONAL", "80000"))
 
 # ==================== 机器人/套利噪音过滤 ====================
@@ -85,9 +82,6 @@ BOT_REPEAT_WINDOW_SEC = float(os.getenv("BOT_REPEAT_WINDOW_SEC", "2.0"))
 BOT_TIMING_SAMPLE_SIZE = int(os.getenv("BOT_TIMING_SAMPLE_SIZE", "8"))
 BOT_TIMING_STD_MAX = float(os.getenv("BOT_TIMING_STD_MAX", "0.035"))
 BOT_TIMING_WINDOW_SEC = float(os.getenv("BOT_TIMING_WINDOW_SEC", "2.0"))
-
-# 批量订阅，降低无效请求/频繁控制消息风险
-MAX_STREAMS_PER_BATCH = int(os.getenv("MAX_STREAMS_PER_BATCH", "80"))
 
 
 # =========================================================
@@ -159,14 +153,13 @@ class TelegramNotifier:
 
 
 # =========================================================
-# Futures Universe（纯合约）
+# Futures Universe
 # =========================================================
 
 class FuturesUniverse:
     def __init__(self, futures_rest_base: str):
         self.futures_rest_base = futures_rest_base
         self.session: Optional[aiohttp.ClientSession] = None
-
         self.all_symbols: Set[str] = set()
         self.allowed_symbols: Set[str] = set()
         self.source: str = "unknown"  # api / env / default / error
@@ -207,22 +200,15 @@ class FuturesUniverse:
                             len(fallback_symbols),
                         )
                         return fallback_symbols
-
                     self.source = "error"
-                    logging.warning("期货API返回451，且没有任何可用的回退合约列表。")
+                    logging.warning("期货API返回451，且没有可用回退合约列表。")
                     return set()
 
                 if resp.status != 200:
                     self.source = "error"
                     logging.warning("Futures exchangeInfo 非200: status=%s body=%s", resp.status, text[:300])
-
                     if fallback_symbols:
                         self.source = "default" if not os.getenv("FUTURES_SYMBOLS", "").strip() else "env"
-                        logging.warning(
-                            "exchangeInfo 获取失败，已改用%s合约列表，共 %s 个币种",
-                            "内置默认" if self.source == "default" else "FUTURES_SYMBOLS",
-                            len(fallback_symbols),
-                        )
                         return fallback_symbols
                     return set()
 
@@ -231,47 +217,34 @@ class FuturesUniverse:
                 except json.JSONDecodeError:
                     self.source = "error"
                     logging.warning("Futures exchangeInfo 返回的不是JSON: %s", text[:300])
-
                     if fallback_symbols:
                         self.source = "default" if not os.getenv("FUTURES_SYMBOLS", "").strip() else "env"
-                        logging.warning(
-                            "JSON解析失败，已改用%s合约列表，共 %s 个币种",
-                            "内置默认" if self.source == "default" else "FUTURES_SYMBOLS",
-                            len(fallback_symbols),
-                        )
                         return fallback_symbols
                     return set()
 
         except Exception:
             if fallback_symbols:
                 self.source = "default" if not os.getenv("FUTURES_SYMBOLS", "").strip() else "env"
-                logging.exception(
-                    "获取 Futures exchangeInfo 失败，已改用%s合约列表",
-                    "内置默认" if self.source == "default" else "FUTURES_SYMBOLS",
-                )
+                logging.exception("获取 Futures exchangeInfo 失败，已改用回退合约列表")
                 return fallback_symbols
-
             self.source = "error"
-            logging.exception("获取 Futures exchangeInfo 失败，且没有任何可用的回退合约列表")
+            logging.exception("获取 Futures exchangeInfo 失败，且没有可用回退合约列表")
             return set()
 
         symbols: Set[str] = set()
         for item in data.get("symbols", []):
             if not isinstance(item, dict):
                 continue
-
             symbol = item.get("symbol", "").upper()
             status = item.get("status", "")
             quote_asset = item.get("quoteAsset", "").upper()
             contract_type = item.get("contractType", "")
-
             if status != "TRADING":
                 continue
             if quote_asset != QUOTE_ASSET:
                 continue
             if contract_type != "PERPETUAL":
                 continue
-
             symbols.add(symbol)
 
         self.source = "api"
@@ -327,10 +300,7 @@ class FuturesUniverse:
             self.allowed_symbols = set(sorted(symbols)[:TOP_N_FUTURES])
             logging.info(
                 "纯合约交易池刷新完成：全部合约=%s，24h排行不可用，退化使用前%s个，最终=%s，来源=%s",
-                len(symbols),
-                TOP_N_FUTURES,
-                len(self.allowed_symbols),
-                self.source,
+                len(symbols), TOP_N_FUTURES, len(self.allowed_symbols), self.source
             )
             return
 
@@ -338,19 +308,15 @@ class FuturesUniverse:
         for item in tickers:
             if not isinstance(item, dict):
                 continue
-
             symbol = item.get("symbol", "").upper()
             if symbol not in symbols:
                 continue
-
             try:
                 quote_volume = float(item.get("quoteVolume", 0.0) or 0.0)
             except (TypeError, ValueError):
                 continue
-
             if quote_volume < MIN_24H_QUOTE_VOLUME:
                 continue
-
             ranked.append((symbol, quote_volume))
 
         ranked.sort(key=lambda x: x[1], reverse=True)
@@ -361,15 +327,12 @@ class FuturesUniverse:
 
         logging.info(
             "纯合约交易池刷新完成：全部合约=%s，24h达标=%s，最终订阅=%s，来源=%s",
-            len(symbols),
-            len(ranked),
-            len(self.allowed_symbols),
-            self.source,
+            len(symbols), len(ranked), len(self.allowed_symbols), self.source
         )
 
 
 # =========================================================
-# Scanner（纯合约即时主动成交）
+# Scanner
 # =========================================================
 
 class FuturesOrderFlowScanner:
@@ -386,6 +349,7 @@ class FuturesOrderFlowScanner:
         self.health_runner: Optional[web.AppRunner] = None
         self._stop_event = asyncio.Event()
         self._last_universe_refresh = 0.0
+        self._ws_symbol_snapshot: Set[str] = set()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -402,17 +366,14 @@ class FuturesOrderFlowScanner:
         now = time.time()
         dq = self.trade_flow[symbol]
         cutoff = now - max(sec, 10.0)
-
         while dq and dq[0].ts < cutoff:
             dq.popleft()
-
         return [x for x in dq if x.ts >= now - sec]
 
     def _is_alternating_micro_bot(self, events: List[AggTradeEvent]) -> bool:
         micro = [e for e in events if e.notional <= BOT_MAX_MICRO_NOTIONAL]
         if len(micro) < BOT_ALTERNATING_COUNT:
             return False
-
         recent = micro[-BOT_ALTERNATING_COUNT:]
         sides = [e.side for e in recent]
         alternating = sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1])
@@ -422,19 +383,16 @@ class FuturesOrderFlowScanner:
     def _is_repetitive_size_bot(self, events: List[AggTradeEvent]) -> bool:
         if len(events) < BOT_REPEAT_SAMPLE_SIZE:
             return False
-
         recent = events[-BOT_REPEAT_SAMPLE_SIZE:]
         span = recent[-1].ts - recent[0].ts
         if span > BOT_REPEAT_WINDOW_SEC:
             return False
-
         qty_keys = {round(e.qty, 6) for e in recent}
         notional_keys = {round(e.notional, 1) for e in recent}
         same_side_ratio = max(
             sum(1 for e in recent if e.side == "buy"),
             sum(1 for e in recent if e.side == "sell"),
         ) / len(recent)
-
         return (
             len(qty_keys) <= BOT_REPEAT_QTY_UNIQUENESS_MAX
             and len(notional_keys) <= BOT_REPEAT_NOTIONAL_UNIQUENESS_MAX
@@ -444,7 +402,6 @@ class FuturesOrderFlowScanner:
     def _is_uniform_timing_bot(self, events: List[AggTradeEvent]) -> bool:
         if len(events) < BOT_TIMING_SAMPLE_SIZE:
             return False
-
         recent = events[-BOT_TIMING_SAMPLE_SIZE:]
         span = recent[-1].ts - recent[0].ts
         if span > BOT_TIMING_WINDOW_SEC:
@@ -474,7 +431,6 @@ class FuturesOrderFlowScanner:
     def _is_bot_or_arb_noise(self, events: List[AggTradeEvent]) -> bool:
         if not events:
             return False
-
         if self._is_alternating_micro_bot(events):
             return True
         if self._is_repetitive_size_bot(events):
@@ -489,19 +445,14 @@ class FuturesOrderFlowScanner:
             return True
 
         dominance = max(buy_notional, sell_notional) / total_notional
-        if dominance <= FLOW_BALANCE_NOISE_MAX_DOMINANCE:
-            return True
-
-        return False
+        return dominance <= FLOW_BALANCE_NOISE_MAX_DOMINANCE
 
     def _detect_single_large_market_order(self, symbol: str, event: AggTradeEvent) -> Optional[dict]:
         if event.notional < SINGLE_PRINT_NOTIONAL:
             return None
-
         recent = self._get_trade_window(symbol, 1.2)
         if self._is_bot_or_arb_noise(recent):
             return None
-
         return {
             "type": "single_buy" if event.side == "buy" else "single_sell",
             "price": event.price,
@@ -512,7 +463,6 @@ class FuturesOrderFlowScanner:
 
     def _detect_aggressive_cluster(self, symbol: str) -> Optional[dict]:
         events = self._get_trade_window(symbol, FLOW_WINDOW_SEC)
-
         if len(events) < FLOW_MIN_TRADE_COUNT:
             return None
         if self._is_bot_or_arb_noise(events):
@@ -521,23 +471,18 @@ class FuturesOrderFlowScanner:
         buy_notional = sum(e.notional for e in events if e.side == "buy")
         sell_notional = sum(e.notional for e in events if e.side == "sell")
         total_notional = buy_notional + sell_notional
-
         if total_notional < FLOW_MIN_TOTAL_NOTIONAL:
             return None
 
         dominant_side = "buy" if buy_notional >= sell_notional else "sell"
         dominant_notional = max(buy_notional, sell_notional)
         dominance = dominant_notional / total_notional if total_notional > 0 else 0.0
-
         if dominance < FLOW_MIN_DOMINANCE:
             return None
 
         max_single = max(e.notional for e in events)
         if max_single < FLOW_SINGLE_LARGE_NOTIONAL:
             return None
-
-        start_price = events[0].price
-        end_price = events[-1].price
 
         return {
             "type": "cluster_buy" if dominant_side == "buy" else "cluster_sell",
@@ -546,8 +491,8 @@ class FuturesOrderFlowScanner:
             "dominance": dominance,
             "max_single": max_single,
             "trade_count": len(events),
-            "start_price": start_price,
-            "end_price": end_price,
+            "start_price": events[0].price,
+            "end_price": events[-1].price,
         }
 
     async def _alert_single_large_market_order(self, symbol: str, result: dict) -> None:
@@ -595,86 +540,9 @@ class FuturesOrderFlowScanner:
         )
         await self._maybe_alert(f"cluster:{symbol}:{result['type']}", msg)
 
-    async def _health(self, request: web.Request) -> web.Response:
-        now = time.time()
-        return web.json_response({
-            "ok": True,
-            "connected": self.runtime.connected,
-            "ws_url": self.runtime.ws_url,
-            "uptime_sec": round(now - self.runtime.started_at, 2),
-            "last_message_at": self.runtime.last_message_at,
-            "reconnect_count": self.runtime.reconnect_count,
-            "universe_size": self.runtime.universe_size,
-            "subscribed_count": self.runtime.subscribed_count,
-            "futures_source": self.universe.source,
-            "active_symbols": sorted(self.active_symbols),
-            "last_error": self.runtime.last_error,
-        })
-
-    async def _root(self, request: web.Request) -> web.Response:
-        return web.Response(text="futures aggressive scanner is running")
-
-    async def _start_health_server(self) -> None:
-        app = web.Application()
-        app.router.add_get("/", self._root)
-        app.router.add_get("/health", self._health)
-
-        self.health_runner = web.AppRunner(app)
-        await self.health_runner.setup()
-        site = web.TCPSite(self.health_runner, "0.0.0.0", PORT)
-        await site.start()
-        logging.info("健康检查服务已启动: 0.0.0.0:%s", PORT)
-
-    @staticmethod
-    def _chunked(items: List[str], size: int) -> List[List[str]]:
-        return [items[i:i + size] for i in range(0, len(items), size)]
-
-    async def _send_ws_control(self, method: str, params: List[str]) -> None:
-        if not params or self.ws is None:
-            return
-
-        for batch in self._chunked(params, MAX_STREAMS_PER_BATCH):
-            req = {
-                "method": method,
-                "params": batch,
-                "id": int(time.time() * 1000) % 100000000,
-            }
-            await self.ws.send(json.dumps(req))
-            logging.info("已发送%s请求: %s", method, ", ".join(batch))
-            await asyncio.sleep(0.15)
-
-    async def _subscribe_streams(self, params: List[str]) -> None:
-        await self._send_ws_control("SUBSCRIBE", params)
-
-    async def _unsubscribe_streams(self, params: List[str]) -> None:
-        await self._send_ws_control("UNSUBSCRIBE", params)
-
-    async def _handle_control_response(self, payload: dict) -> None:
-        if "result" in payload:
-            if payload.get("result") is None:
-                logging.info("WebSocket订阅操作成功，id=%s", payload.get("id"))
-            else:
-                logging.info("WebSocket 控制响应: %s", payload)
-
-    async def _apply_active_symbols(self, next_set: Set[str]) -> None:
-        added = next_set - self.active_symbols
-        removed = self.active_symbols - next_set
-
-        unsub = [f"{s.lower()}@aggTrade" for s in sorted(removed)]
-        sub = [f"{s.lower()}@aggTrade" for s in sorted(added)]
-
-        if unsub:
-            await self._unsubscribe_streams(unsub)
-        if sub:
-            await self._subscribe_streams(sub)
-
-        self.active_symbols = next_set
-        self.runtime.subscribed_count = len(self.active_symbols)
-
-    async def _refresh_active_symbols(self) -> None:
-        await self.universe.refresh()
-        self.runtime.universe_size = len(self.universe.allowed_symbols)
-        await self._apply_active_symbols(set(sorted(self.universe.allowed_symbols)))
+    def _build_combined_stream_url(self, symbols: Set[str]) -> str:
+        streams = "/".join(f"{s.lower()}@aggTrade" for s in sorted(symbols))
+        return f"{FUTURES_WS_ORIGIN}/stream?streams={streams}"
 
     async def _handle_agg_trade(self, data: dict) -> None:
         if not isinstance(data, dict):
@@ -695,8 +563,6 @@ class FuturesOrderFlowScanner:
             return
 
         notional = price * qty
-
-        # m=true => buyer is maker => taker sell（主动卖）
         is_buyer_maker = bool(data.get("m", False))
         side = "sell" if is_buyer_maker else "buy"
 
@@ -729,44 +595,74 @@ class FuturesOrderFlowScanner:
         if not isinstance(payload, dict):
             return
 
-        if "result" in payload and "id" in payload:
-            await self._handle_control_response(payload)
-            return
-
         stream = payload.get("stream", "")
         data = payload.get("data")
 
-        # raw 模式下也兼容没有 stream 包装的情况
-        if isinstance(data, dict) and isinstance(stream, str) and stream.endswith("@aggTrade"):
+        if isinstance(stream, str) and stream.endswith("@aggTrade") and isinstance(data, dict):
             await self._handle_agg_trade(data)
             return
 
-        event_type = payload.get("e")
-        if event_type == "aggTrade":
+        if payload.get("e") == "aggTrade":
             await self._handle_agg_trade(payload)
 
-    async def _periodic_universe_refresh(self) -> None:
+    async def _health(self, request: web.Request) -> web.Response:
+        now = time.time()
+        return web.json_response({
+            "ok": True,
+            "connected": self.runtime.connected,
+            "ws_url": self.runtime.ws_url,
+            "uptime_sec": round(now - self.runtime.started_at, 2),
+            "last_message_at": self.runtime.last_message_at,
+            "reconnect_count": self.runtime.reconnect_count,
+            "universe_size": self.runtime.universe_size,
+            "subscribed_count": self.runtime.subscribed_count,
+            "futures_source": self.universe.source,
+            "active_symbols": sorted(self.active_symbols),
+            "last_error": self.runtime.last_error,
+        })
+
+    async def _root(self, request: web.Request) -> web.Response:
+        return web.Response(text="futures aggressive scanner is running")
+
+    async def _start_health_server(self) -> None:
+        app = web.Application()
+        app.router.add_get("/", self._root)
+        app.router.add_get("/health", self._health)
+        self.health_runner = web.AppRunner(app)
+        await self.health_runner.setup()
+        site = web.TCPSite(self.health_runner, "0.0.0.0", PORT)
+        await site.start()
+        logging.info("健康检查服务已启动: 0.0.0.0:%s", PORT)
+
+    async def _refresh_universe(self) -> None:
+        await self.universe.refresh()
+        self.active_symbols = set(sorted(self.universe.allowed_symbols))
+        self.runtime.universe_size = len(self.universe.allowed_symbols)
+        self.runtime.subscribed_count = len(self.active_symbols)
+
+    async def _periodic_universe_refresh(self) -> bool:
         now = time.time()
         if now - self._last_universe_refresh < UNIVERSE_REFRESH_SEC:
-            return
+            return False
 
         self._last_universe_refresh = now
-        await self._refresh_active_symbols()
+        before = set(self.active_symbols)
+        await self._refresh_universe()
+        after = set(self.active_symbols)
+        return before != after
 
     async def _idle_until_universe_available(self) -> None:
         while not self._stop_event.is_set() and not self.universe.allowed_symbols:
             logging.info("当前无可监控合约，%s 秒后重试刷新交易池", EMPTY_UNIVERSE_RETRY_SEC)
             await asyncio.sleep(EMPTY_UNIVERSE_RETRY_SEC)
-            await self.universe.refresh()
-            self.runtime.universe_size = len(self.universe.allowed_symbols)
+            await self._refresh_universe()
             self._last_universe_refresh = time.time()
 
     async def start(self) -> None:
         await self.universe.start()
         await self.notifier.start()
 
-        await self.universe.refresh()
-        self.runtime.universe_size = len(self.universe.allowed_symbols)
+        await self._refresh_universe()
         self._last_universe_refresh = time.time()
 
         if ENABLE_HEALTHCHECK:
@@ -811,15 +707,16 @@ class FuturesOrderFlowScanner:
             self.health_runner = None
 
     async def _run(self) -> None:
-        ws_url = f"{FUTURES_WS_ORIGIN}/ws"
-        self.runtime.ws_url = ws_url
-
         while not self._stop_event.is_set():
             try:
                 if not self.universe.allowed_symbols:
                     self.runtime.connected = False
                     await self._idle_until_universe_available()
                     continue
+
+                ws_url = self._build_combined_stream_url(self.universe.allowed_symbols)
+                self._ws_symbol_snapshot = set(self.universe.allowed_symbols)
+                self.runtime.ws_url = ws_url
 
                 logging.info("正在连接 Futures WebSocket: %s", ws_url)
 
@@ -835,16 +732,21 @@ class FuturesOrderFlowScanner:
                     self.runtime.last_error = ""
                     logging.info("Futures WebSocket 已连接")
 
-                    # 直接批量订阅当前交易池，不再使用占位流
-                    await self._apply_active_symbols(set(sorted(self.universe.allowed_symbols)))
-
                     while not self._stop_event.is_set():
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=30)
                             await self._handle_message(msg)
-                            await self._periodic_universe_refresh()
+
+                            changed = await self._periodic_universe_refresh()
+                            if changed or self._ws_symbol_snapshot != self.universe.allowed_symbols:
+                                logging.info("交易池已变化，准备重连新的组合流")
+                                break
+
                         except asyncio.TimeoutError:
-                            await self._periodic_universe_refresh()
+                            changed = await self._periodic_universe_refresh()
+                            if changed or self._ws_symbol_snapshot != self.universe.allowed_symbols:
+                                logging.info("交易池已变化，准备重连新的组合流")
+                                break
                             continue
                         except ConnectionClosed as e:
                             self.runtime.last_error = f"ConnectionClosed: code={e.code} reason={e.reason}"
