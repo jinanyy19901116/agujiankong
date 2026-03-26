@@ -55,6 +55,26 @@ EXCLUDED_SYMBOLS: Set[str] = {
     if x.strip()
 }
 
+# Upbit 热门币白名单（静态建议版，可用环境变量覆盖）
+UPBIT_HOT_SYMBOLS: Set[str] = {
+    x.strip().upper()
+    for x in os.getenv(
+        "UPBIT_HOT_SYMBOLS",
+        (
+            "XRPUSDT,DOGEUSDT,SEIUSDT,SUIUSDT,APTUSDT,ARBUSDT,OPUSDT,"
+            "WLDUSDT,STXUSDT,INJUSDT,RUNEUSDT,IMXUSDT,FETUSDT,GRTUSDT,"
+            "THETAUSDT,AAVEUSDT,NEARUSDT,HBARUSDT,ALGOUSDT,ATOMUSDT,"
+            "TONUSDT,TIAUSDT,JUPUSDT,BLURUSDT,PEOPLEUSDT,ARKMUSDT,"
+            "WIFUSDT,ORDIUSDT,SATSUSDT,1000PEPEUSDT,1000BONKUSDT,"
+            "ENAUSDT,NOTUSDT,TURBOUSDT,MEMEUSDT,BOMEUSDT,AEVOUSDT,"
+            "IDUSDT,AIUSDT,PORTALUSDT,STRKUSDT,PIXELUSDT,BEAMXUSDT,"
+            "CFXUSDT,ROSEUSDT,CELOUSDT,ANKRUSDT,SKLUSDT,API3USDT,"
+            "MINAUSDT,ASTRUSDT,KAVAUSDT,ZILUSDT,ICXUSDT,ONEUSDT"
+        )
+    ).split(",")
+    if x.strip()
+}
+
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "180"))
 
 # 大额主动成交
@@ -311,12 +331,13 @@ class BinanceUniverse:
 
         self.spot_symbols = spot_symbols
         self.futures_symbols = futures_symbols
-        self.allowed_symbols = spot_symbols & futures_symbols
+        self.allowed_symbols = (spot_symbols & futures_symbols) & UPBIT_HOT_SYMBOLS
 
         logging.info(
-            "交易池刷新完成: 现货山寨币=%s, 合约参照币种=%s, 最终可监控=%s, 合约来源=%s",
+            "交易池刷新完成: 现货山寨币=%s, 合约参照币种=%s, Upbit白名单=%s, 最终可监控=%s, 合约来源=%s",
             len(spot_symbols),
             len(futures_symbols),
+            len(UPBIT_HOT_SYMBOLS),
             len(self.allowed_symbols),
             self.futures_source,
         )
@@ -653,6 +674,7 @@ class OrderFlowScanner:
         ts = float(data.get("T", 0)) / 1000.0
         notional = price * qty
 
+        # m=true => buyer is maker => 主动卖盘
         is_buyer_maker = bool(data.get("m", False))
         side = "sell" if is_buyer_maker else "buy"
 
@@ -736,7 +758,7 @@ class OrderFlowScanner:
 
         await self.notifier.send(
             "【系统启动成功】\n"
-            "仅监控有 USDⓈ-M 合约的币种\n"
+            "仅监控有 USDⓈ-M 合约且在 Upbit 热门白名单中的币种\n"
             "仅监控：大额主动成交 / 疑似限价承接与压盘\n"
             "不使用涨跌幅、热度分数\n"
             f"合约币种来源：{source_text}"
