@@ -173,6 +173,7 @@ class BinanceUniverse:
         self.allowed_symbols: Set[str] = set()
         self.spot_symbols: Set[str] = set()
         self.futures_symbols: Set[str] = set()
+        self.futures_source: str = "unknown"  # api / env / unknown
 
     async def start(self) -> None:
         if self.session is None:
@@ -215,14 +216,52 @@ class BinanceUniverse:
             allowed.add(symbol)
         return allowed
 
+    def _load_futures_symbols_from_env(self) -> Set[str]:
+        raw = os.getenv("FUTURES_SYMBOLS", "").strip()
+        if not raw:
+            return set()
+
+        return {
+            s.strip().upper()
+            for s in raw.split(",")
+            if s.strip()
+        }
+
     async def _fetch_usdm_futures_symbols(self) -> Set[str]:
         if self.session is None:
             await self.start()
 
         url = f"{self.futures_rest_base}/fapi/v1/exchangeInfo"
-        async with self.session.get(url) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
+
+        try:
+            async with self.session.get(url) as resp:
+                if resp.status == 451:
+                    env_symbols = self._load_futures_symbols_from_env()
+                    if env_symbols:
+                        self.futures_source = "env"
+                        logging.warning(
+                            "Futures API 返回 451，已改用环境变量 FUTURES_SYMBOLS，共 %s 个币种",
+                            len(env_symbols),
+                        )
+                        return env_symbols
+                    raise RuntimeError(
+                        "Futures API 返回 451，且未设置 FUTURES_SYMBOLS 环境变量，无法筛选“有合约的币种”。"
+                    )
+
+                resp.raise_for_status()
+                data = await resp.json()
+
+        except aiohttp.ClientResponseError as e:
+            if e.status == 451:
+                env_symbols = self._load_futures_symbols_from_env()
+                if env_symbols:
+                    self.futures_source = "env"
+                    logging.warning(
+                        "Futures API 返回 451，已改用环境变量 FUTURES_SYMBOLS，共 %s 个币种",
+                        len(env_symbols),
+                    )
+                    return env_symbols
+            raise
 
         futures_symbols: Set[str] = set()
         for item in data.get("symbols", []):
@@ -237,6 +276,7 @@ class BinanceUniverse:
 
             futures_symbols.add(symbol)
 
+        self.futures_source = "api"
         return futures_symbols
 
     async def refresh(self) -> None:
@@ -253,10 +293,11 @@ class BinanceUniverse:
         self.allowed_symbols = spot_symbols & futures_symbols
 
         logging.info(
-            "交易池刷新完成: 现货山寨币=%s, 合约币种=%s, 最终可监控=%s",
+            "交易池刷新完成: 现货山寨币=%s, 合约参照币种=%s, 最终可监控=%s, 合约来源=%s",
             len(spot_symbols),
             len(futures_symbols),
             len(self.allowed_symbols),
+            self.futures_source,
         )
 
 
@@ -384,9 +425,11 @@ class OrderFlowScanner:
         last_trade_price = trades[-1].price
         move_pct = self._pct_change(first_trade_price, last_trade_price)
 
-        # 疑似大限价买单承接：
-        # 主动卖盘很多，但价格没怎么跌
-        if sell_notional >= ABSORPTION_MIN_NOTIONAL and abs(move_pct) <= ABSORPTION_MAX_PRICE_MOVE_PCT and move_pct > -ABSORPTION_MAX_PRICE_MOVE_PCT:
+        if (
+            sell_notional >= ABSORPTION_MIN_NOTIONAL
+            and abs(move_pct) <= ABSORPTION_MAX_PRICE_MOVE_PCT
+            and move_pct > -ABSORPTION_MAX_PRICE_MOVE_PCT
+        ):
             return {
                 "type": "buy_absorption",
                 "notional": sell_notional,
@@ -396,9 +439,11 @@ class OrderFlowScanner:
                 "book_updates": len(books),
             }
 
-        # 疑似大限价卖单压盘：
-        # 主动买盘很多，但价格没怎么涨
-        if buy_notional >= ABSORPTION_MIN_NOTIONAL and abs(move_pct) <= ABSORPTION_MAX_PRICE_MOVE_PCT and move_pct < ABSORPTION_MAX_PRICE_MOVE_PCT:
+        if (
+            buy_notional >= ABSORPTION_MIN_NOTIONAL
+            and abs(move_pct) <= ABSORPTION_MAX_PRICE_MOVE_PCT
+            and move_pct < ABSORPTION_MAX_PRICE_MOVE_PCT
+        ):
             return {
                 "type": "sell_absorption",
                 "notional": buy_notional,
@@ -464,6 +509,7 @@ class OrderFlowScanner:
             "subscribed_count": self.runtime.subscribed_count,
             "spot_symbol_count": len(self.universe.spot_symbols),
             "futures_symbol_count": len(self.universe.futures_symbols),
+            "futures_source": self.universe.futures_source,
             "last_error": self.runtime.last_error,
         })
 
@@ -586,7 +632,6 @@ class OrderFlowScanner:
         ts = float(data.get("T", 0)) / 1000.0
         notional = price * qty
 
-        # m=true => buyer is maker => 主动卖盘
         is_buyer_maker = bool(data.get("m", False))
         side = "sell" if is_buyer_maker else "buy"
 
@@ -659,11 +704,14 @@ class OrderFlowScanner:
         if ENABLE_HEALTHCHECK:
             await self._start_health_server()
 
+        source_text = "Binance Futures API" if self.universe.futures_source == "api" else "环境变量 FUTURES_SYMBOLS"
+
         await self.notifier.send(
             "【系统启动成功】\n"
             "仅监控有 USDⓈ-M 合约的币种\n"
             "仅监控：大额主动成交 / 疑似限价承接与压盘\n"
-            "不使用涨跌幅、热度分数"
+            "不使用涨跌幅、热度分数\n"
+            f"合约币种来源：{source_text}"
         )
 
         await self._run()
