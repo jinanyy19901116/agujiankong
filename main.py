@@ -104,8 +104,8 @@ EXCHANGE_KEYWORDS = [
     if x.strip()
 ]
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_BOT_TOKEN = 8457400925:AAFGn5R2VEaNqnxWMl_udv2tTeUnk
+TELEGRAM_CHAT_ID = 6308781694
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
