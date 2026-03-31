@@ -16,7 +16,7 @@ ARKHAM_WS_BASE = "wss://api.arkm.com/ws/transfers"
 
 API_KEY = os.getenv("ARKHAM_API_KEY", "").strip()
 
-# 固定币种（已去 KRW-）
+# 重点监控币种（已去 KRW-）
 TOKEN_WHITELIST = [
     "sent", "sol", "cfg", "doge", "dood", "ankr", "bard", "tao", "elsa", "ada",
     "ip", "kite", "ong", "vana", "kat", "wld", "sui", "la", "steem", "virtual",
@@ -31,15 +31,15 @@ CHAIN_WHITELIST = [
     if x.strip()
 ]
 
-USD_THRESHOLD = float(os.getenv("USD_THRESHOLD", "50000"))
+# 单笔最低金额
+USD_THRESHOLD = float(os.getenv("USD_THRESHOLD", "150000"))
 
-EXCHANGE_KEYWORDS = [
-    "upbit", "up-bit",
-    "mexc",
-    "coinex",
-    "kucoin",
-]
+# 连续行为窗口
+SIGNAL_WINDOW_SECONDS = int(os.getenv("SIGNAL_WINDOW_SECONDS", "600"))  # 默认10分钟
+MIN_REPEAT = int(os.getenv("MIN_REPEAT", "2"))  # 至少连续2笔
+MIN_CUMULATIVE_USD = float(os.getenv("MIN_CUMULATIVE_USD", "300000"))  # 窗口内累计金额
 
+# Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -47,7 +47,10 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 
 RECONNECT_MIN = 3
 RECONNECT_MAX = 60
-MAX_SEEN_SIZE = 5000
+MAX_SEEN_SIZE = 10000
+
+# 连续行为缓存
+recent_flows: List[Dict[str, Any]] = []
 
 
 def setup_logger() -> None:
@@ -69,7 +72,7 @@ def arkham_headers() -> Dict[str, str]:
         "API-Key": API_KEY,
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "exchange-flow-monitor/6.0",
+        "User-Agent": "arkham-smart-money-monitor/8.0",
     }
 
 
@@ -170,28 +173,22 @@ def get_to_text(item: Dict[str, Any]) -> str:
     return " | ".join([as_str(x).strip() for x in parts if x])
 
 
-def contains_exchange(text: str) -> bool:
-    text = (text or "").lower()
-    return any(k in text for k in EXCHANGE_KEYWORDS)
+def get_from_actor_key(item: Dict[str, Any]) -> str:
+    return (
+        as_str(safe_get(item, "fromEntity", default=None)).strip().lower()
+        or as_str(safe_get(item, "fromLabel", default=None)).strip().lower()
+        or as_str(safe_get(item, "fromAddress", default=None)).strip().lower()
+        or as_str(safe_get(item, "from", default=None)).strip().lower()
+    )
 
 
-def classify_direction(item: Dict[str, Any]) -> str:
-    from_text = get_from_text(item)
-    to_text = get_to_text(item)
-
-    from_is_exchange = contains_exchange(from_text)
-    to_is_exchange = contains_exchange(to_text)
-
-    if from_is_exchange and not to_is_exchange:
-        return "交易所流出"
-
-    if not from_is_exchange and to_is_exchange:
-        return "交易所流入"
-
-    if from_is_exchange and to_is_exchange:
-        return "交易所互转"
-
-    return "无关"
+def get_to_actor_key(item: Dict[str, Any]) -> str:
+    return (
+        as_str(safe_get(item, "toEntity", default=None)).strip().lower()
+        or as_str(safe_get(item, "toLabel", default=None)).strip().lower()
+        or as_str(safe_get(item, "toAddress", default=None)).strip().lower()
+        or as_str(safe_get(item, "to", default=None)).strip().lower()
+    )
 
 
 def format_beijing_time(raw_ts: Any) -> str:
@@ -246,6 +243,123 @@ def chain_matches(item: Dict[str, Any]) -> bool:
     return get_chain(item).lower() in set(CHAIN_WHITELIST)
 
 
+# ---- 交易所 / 机器人 / 主力地址过滤 ----
+
+EXCHANGE_KEYWORDS = [
+    "exchange", "cex", "binance", "upbit", "mexc", "coinex", "kucoin", "coinbase",
+    "kraken", "okx", "bybit", "bitget", "gate", "htx", "bithumb", "bitfinex"
+]
+
+# 尽量排除套利机器人、做市商、路由器、DEX、桥、聚合器、MEV、协议金库
+BOT_LIKE_KEYWORDS = [
+    "market maker", "mm", "router", "aggregator", "arb", "arbitrage", "mev",
+    "searcher", "bridge", "wormhole", "portal", "relay", "vault", "treasury",
+    "liquidity", "lp", "pool", "pair", "staking", "farm", "protocol", "dex",
+    "uniswap", "pancakeswap", "curve", "balancer", "jupiter", "1inch", "paraswap",
+    "cowswap", "solver", "contract", "deployer", "bundler", "bot"
+]
+
+
+def contains_any_keyword(text: str, keywords: List[str]) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in keywords)
+
+
+def is_exchange_text(text: str) -> bool:
+    return contains_any_keyword(text, EXCHANGE_KEYWORDS)
+
+
+def is_bot_like_text(text: str) -> bool:
+    return contains_any_keyword(text, BOT_LIKE_KEYWORDS)
+
+
+def classify_direction(item: Dict[str, Any]) -> str:
+    from_text = get_from_text(item)
+    to_text = get_to_text(item)
+
+    from_is_exchange = is_exchange_text(from_text)
+    to_is_exchange = is_exchange_text(to_text)
+
+    if from_is_exchange and not to_is_exchange:
+        return "交易所流出"
+
+    if not from_is_exchange and to_is_exchange:
+        return "交易所流入"
+
+    if from_is_exchange and to_is_exchange:
+        return "交易所互转"
+
+    return "无关"
+
+
+def is_suspected_bot_flow(item: Dict[str, Any]) -> bool:
+    """
+    高概率排除机器人/套利/做市/路由/桥等。
+    不是100%准确，而是保守过滤。
+    """
+    from_text = get_from_text(item)
+    to_text = get_to_text(item)
+
+    # 交易所一侧允许；我们主要排除“非交易所一侧”是机器人/协议/路由器
+    direction = classify_direction(item)
+    if direction == "交易所流出":
+        non_exchange_side = to_text
+    elif direction == "交易所流入":
+        non_exchange_side = from_text
+    else:
+        return True
+
+    return is_bot_like_text(non_exchange_side)
+
+
+def get_non_exchange_actor_key(item: Dict[str, Any]) -> str:
+    direction = classify_direction(item)
+    if direction == "交易所流出":
+        return get_to_actor_key(item)
+    if direction == "交易所流入":
+        return get_from_actor_key(item)
+    return ""
+
+
+# ---- 连续行为识别 ----
+
+def cleanup_recent_flows() -> None:
+    now = time.time()
+    recent_flows[:] = [x for x in recent_flows if now - x["ts"] <= SIGNAL_WINDOW_SECONDS]
+
+
+def add_flow(symbol: str, direction: str, actor_key: str, usd: float, tx_hash: str) -> None:
+    cleanup_recent_flows()
+    recent_flows.append({
+        "ts": time.time(),
+        "symbol": symbol.lower(),
+        "direction": direction,
+        "actor_key": actor_key.lower(),
+        "usd": usd,
+        "tx_hash": tx_hash.lower(),
+    })
+
+
+def detect_smart_money(symbol: str, direction: str, actor_key: str) -> Dict[str, Any]:
+    cleanup_recent_flows()
+
+    flows = [
+        x for x in recent_flows
+        if x["symbol"] == symbol.lower()
+        and x["direction"] == direction
+        and x["actor_key"] == actor_key.lower()
+    ]
+
+    unique_txs = {x["tx_hash"] for x in flows if x["tx_hash"]}
+    cumulative_usd = sum(x["usd"] for x in flows)
+
+    return {
+        "repeat_count": len(unique_txs),
+        "cumulative_usd": cumulative_usd,
+        "qualified": len(unique_txs) >= MIN_REPEAT and cumulative_usd >= MIN_CUMULATIVE_USD,
+    }
+
+
 def should_alert(item: Dict[str, Any]) -> bool:
     if not token_matches(item):
         return False
@@ -258,6 +372,9 @@ def should_alert(item: Dict[str, Any]) -> bool:
 
     direction = classify_direction(item)
     if direction not in ("交易所流出", "交易所流入"):
+        return False
+
+    if is_suspected_bot_flow(item):
         return False
 
     return True
@@ -348,10 +465,7 @@ def telegram_send(text: str) -> None:
     try:
         requests.post(
             url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text[:4000],
-            },
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000]},
             timeout=15,
         )
     except Exception as e:
@@ -359,19 +473,20 @@ def telegram_send(text: str) -> None:
 
 
 def send_startup_test_message() -> None:
-    token_preview = ", ".join(TOKEN_WHITELIST[:12])
+    preview = ", ".join(TOKEN_WHITELIST[:12])
     if len(TOKEN_WHITELIST) > 12:
-        token_preview += " ..."
+        preview += " ..."
 
     text = (
-        "✅ 监控机器人已启动\n"
+        "✅ Arkham 主力地址识别版已启动\n"
         f"启动时间(北京): {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"监控币种数量: {len(TOKEN_WHITELIST)}\n"
-        f"监控币种预览: {token_preview}\n"
-        f"金额阈值(USD): ${USD_THRESHOLD:,.0f}\n"
-        f"链过滤: {', '.join(CHAIN_WHITELIST) if CHAIN_WHITELIST else '全部'}\n"
-        f"交易所: {', '.join(EXCHANGE_KEYWORDS)}\n"
-        "状态: 启动测试成功，开始监听 WebSocket 实时数据"
+        f"币种预览: {preview}\n"
+        f"单笔最低金额: ${USD_THRESHOLD:,.0f}\n"
+        f"连续窗口: {SIGNAL_WINDOW_SECONDS} 秒\n"
+        f"最少连续笔数: {MIN_REPEAT}\n"
+        f"最少累计金额: ${MIN_CUMULATIVE_USD:,.0f}\n"
+        "说明: 已尽量过滤套利机器人、做市商、路由器、桥、DEX、MEV 等标签"
     )
     telegram_send(text)
     logging.info("已尝试发送启动测试消息到 Telegram")
@@ -379,35 +494,52 @@ def send_startup_test_message() -> None:
 
 def analyze_signal(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     direction = classify_direction(item)
-    usd_value = get_usd(item)
-    reasons: List[str] = []
+    usd = get_usd(item)
+    symbol = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-")
+    actor_key = get_non_exchange_actor_key(item)
+    tx_hash = get_tx_hash(item)
 
-    if direction == "交易所流出":
-        reasons.append("大额从交易所流出，偏向提币囤币")
-        bias = "偏多 / 可考虑买多"
-    elif direction == "交易所流入":
-        reasons.append("大额流入交易所，存在卖压风险")
-        bias = "偏空 / 可考虑买空"
-    else:
+    if direction not in ("交易所流出", "交易所流入"):
+        return None
+    if not actor_key:
         return None
 
-    if usd_value >= USD_THRESHOLD:
-        reasons.append(f"金额达到阈值 ${USD_THRESHOLD:,.0f}")
+    add_flow(symbol, direction, actor_key, usd, tx_hash)
+    detection = detect_smart_money(symbol, direction, actor_key)
 
-    reasons.append("命中重点监控币种列表")
+    if not detection["qualified"]:
+        return None
 
-    if CHAIN_WHITELIST:
-        reasons.append("命中链白名单")
+    reasons: List[str] = [
+        f"单笔金额 ≥ ${USD_THRESHOLD:,.0f}",
+        f"同一主力地址在 {SIGNAL_WINDOW_SECONDS} 秒内连续 {detection['repeat_count']} 笔",
+        f"累计金额 ${detection['cumulative_usd']:,.0f}",
+        "已尽量排除套利机器人、做市商、路由器、桥、DEX、MEV 等标签",
+    ]
+
+    if direction == "交易所流出":
+        signal_type = "🟢 主力吸筹"
+        bias = "偏多 / 可考虑买多"
+        reasons.insert(0, "交易所 → 非机器人主力地址，偏向提币吸筹")
+    else:
+        signal_type = "🔴 主力出货"
+        bias = "偏空 / 可考虑买空"
+        reasons.insert(0, "非机器人主力地址 → 交易所，存在卖压风险")
 
     return {
-        "direction": direction,
+        "signal_type": signal_type,
         "bias": bias,
+        "direction": direction,
+        "symbol": symbol,
+        "actor_key": actor_key,
+        "repeat_count": detection["repeat_count"],
+        "cumulative_usd": detection["cumulative_usd"],
         "reasons": reasons,
     }
 
 
 def build_message(item: Dict[str, Any], signal: Dict[str, Any]) -> str:
-    symbol = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-")
+    symbol = signal["symbol"].upper()
     chain = get_chain(item) or "-"
     amount = get_amount(item) or "-"
     usd_value = get_usd(item)
@@ -415,25 +547,18 @@ def build_message(item: Dict[str, Any], signal: Dict[str, Any]) -> str:
     from_text = get_from_text(item) or "-"
     to_text = get_to_text(item) or "-"
     tx = get_tx_hash(item) or "-"
-
-    direction = signal["direction"]
-    if direction == "交易所流出":
-        emoji = "🟢"
-    elif direction == "交易所流入":
-        emoji = "🔴"
-    else:
-        emoji = "⚪"
-
     reasons_text = "\n".join([f"- {x}" for x in signal["reasons"]])
 
     return (
-        f"{emoji} 币种大额买多买空提示\n"
+        f"{signal['signal_type']} 信号\n"
         f"时间(北京): {ts_bj}\n"
-        f"方向: {direction}\n"
         f"建议: {signal['bias']}\n"
-        f"币种: {symbol.upper()}\n"
+        f"币种: {symbol}\n"
         f"链: {chain}\n"
-        f"金额(USD): ${usd_value:,.2f}\n"
+        f"单笔金额(USD): ${usd_value:,.2f}\n"
+        f"累计金额(USD): ${signal['cumulative_usd']:,.2f}\n"
+        f"连续次数: {signal['repeat_count']}\n"
+        f"主力地址标识: {signal['actor_key']}\n"
         f"数量: {amount}\n"
         f"From: {from_text}\n"
         f"To: {to_text}\n"
@@ -448,6 +573,7 @@ async def run_forever() -> None:
 
     seen: List[str] = []
     seen_set = set()
+    alerted_actor_keys: Dict[str, float] = {}
     backoff = RECONNECT_MIN
 
     while True:
@@ -462,7 +588,7 @@ async def run_forever() -> None:
                 ws_url,
                 extra_headers={
                     "API-Key": API_KEY,
-                    "User-Agent": "exchange-flow-monitor/6.0",
+                    "User-Agent": "arkham-smart-money-monitor/8.0",
                 },
                 ping_interval=20,
                 ping_timeout=20,
@@ -487,10 +613,11 @@ async def run_forever() -> None:
                         symbol_dbg = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-")
                         usd_dbg = get_usd(item)
                         direction_dbg = classify_direction(item)
+                        actor_dbg = get_non_exchange_actor_key(item)
 
                         logging.info(
-                            "候选事件: symbol=%s usd=%s direction=%s",
-                            symbol_dbg, usd_dbg, direction_dbg
+                            "候选事件: symbol=%s usd=%s direction=%s actor=%s",
+                            symbol_dbg, usd_dbg, direction_dbg, actor_dbg
                         )
 
                         if not should_alert(item):
@@ -503,6 +630,15 @@ async def run_forever() -> None:
                         signal = analyze_signal(item)
                         if not signal:
                             continue
+
+                        alert_key = f"{signal['symbol']}|{signal['direction']}|{signal['actor_key']}"
+                        now = time.time()
+
+                        # 防止同一主力地址在很短时间内重复刷屏
+                        last_alert_ts = alerted_actor_keys.get(alert_key, 0)
+                        if now - last_alert_ts < SIGNAL_WINDOW_SECONDS:
+                            continue
+                        alerted_actor_keys[alert_key] = now
 
                         seen.append(eid)
                         seen_set.add(eid)
@@ -528,18 +664,19 @@ async def run_forever() -> None:
 def main():
     setup_logger()
 
-    logging.info("币种大额买多买空提示监控启动")
+    logging.info("Arkham 主力地址识别版启动")
     logging.info("TOKEN_WHITELIST数量=%s", len(TOKEN_WHITELIST))
     logging.info("TOKEN_WHITELIST=%s", ",".join(TOKEN_WHITELIST))
     logging.info("CHAIN_WHITELIST=%s", CHAIN_WHITELIST if CHAIN_WHITELIST else "全部")
     logging.info("USD_THRESHOLD=%s", USD_THRESHOLD)
-    logging.info("EXCHANGE_KEYWORDS=%s", EXCHANGE_KEYWORDS)
+    logging.info("SIGNAL_WINDOW_SECONDS=%s", SIGNAL_WINDOW_SECONDS)
+    logging.info("MIN_REPEAT=%s", MIN_REPEAT)
+    logging.info("MIN_CUMULATIVE_USD=%s", MIN_CUMULATIVE_USD)
 
     logging.info("ENV TELEGRAM_BOT_TOKEN = %s", os.getenv("TELEGRAM_BOT_TOKEN"))
     logging.info("ENV TELEGRAM_CHAT_ID = %s", os.getenv("TELEGRAM_CHAT_ID"))
 
     send_startup_test_message()
-
     asyncio.run(run_forever())
 
 
