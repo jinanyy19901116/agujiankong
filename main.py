@@ -1,565 +1,485 @@
 import os
 import json
+import time
 import asyncio
 import logging
-import hashlib
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlencode
-from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
+from collections import defaultdict, deque
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-import requests
+import aiohttp
 import websockets
-
-ARKHAM_HTTP_BASE = "https://api.arkm.com"
-ARKHAM_WS_BASE = "wss://api.arkm.com/ws/transfers"
-
-API_KEY = os.getenv("ARKHAM_API_KEY", "").strip()
-
-# 重点监控币种（已去 KRW-）
-TOKEN_WHITELIST = [
-    "sent", "sol", "cfg", "doge", "dood", "ankr", "bard", "tao", "elsa", "ada",
-    "ip", "kite", "ong", "vana", "kat", "wld", "sui", "la", "steem", "virtual",
-    "gas", "moodeng", "xlm", "sahara", "chz", "trump", "anime", "shib",
-    "sei", "sign", "sonic", "trx", "skr", "bch", "pengu", "kernel", "order",
-    "enso", "ath", "knc", "zbt", "link", "akt", "cpool"
-]
-
-CHAIN_WHITELIST = [
-    x.strip().lower()
-    for x in os.getenv("CHAIN_WHITELIST", "").split(",")
-    if x.strip()
-]
-
-USD_THRESHOLD = float(os.getenv("USD_THRESHOLD", "100000"))
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-BEIJING_TZ = timezone(timedelta(hours=8))
-
-RECONNECT_MIN = 3
-RECONNECT_MAX = 60
-MAX_SEEN_SIZE = 10000
-
-EXCHANGE_KEYWORDS = [
-    "exchange", "cex", "binance", "upbit", "mexc", "coinex", "kucoin", "coinbase",
-    "kraken", "okx", "bybit", "bitget", "gate", "htx", "bithumb", "bitfinex"
-]
-
-BOT_LIKE_KEYWORDS = [
-    "market maker", "mm", "router", "aggregator", "arb", "arbitrage", "mev",
-    "searcher", "bridge", "wormhole", "portal", "relay", "vault", "treasury",
-    "liquidity", "lp", "pool", "pair", "staking", "farm", "protocol", "dex",
-    "uniswap", "pancakeswap", "curve", "balancer", "jupiter", "1inch", "paraswap",
-    "cowswap", "solver", "contract", "deployer", "bundler", "bot"
-]
+from dotenv import load_dotenv
 
 
-def setup_logger() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-    )
+load_dotenv()
+
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 
 
-def normalize_token_symbol(token: str) -> str:
-    token = (token or "").strip().lower()
-    if token.startswith("krw-"):
-        token = token[4:]
-    return token
+def bj_now_str() -> str:
+    return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def arkham_headers() -> Dict[str, str]:
-    return {
-        "API-Key": API_KEY,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "arkham-flow-monitor/9.0",
-    }
-
-
-def safe_get(d: Any, *keys: str, default=None):
-    if not isinstance(d, dict):
-        return default
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return default
-
-
-def as_str(v: Any) -> str:
-    if v is None:
-        return ""
-    return str(v)
-
-
-def as_float(v: Any, default: float = 0.0) -> float:
+def safe_float(v, default=0.0) -> float:
     try:
-        if v is None or v == "":
-            return default
         return float(v)
     except Exception:
         return default
 
 
-def get_symbol(item: Dict[str, Any]) -> str:
-    return as_str(
-        safe_get(item, "symbol", "tokenSymbol", "token", "tokenId", default="")
-    ).strip()
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    return value in {"1", "true", "yes", "y", "on"}
 
 
-def get_token_id(item: Dict[str, Any]) -> str:
-    return as_str(safe_get(item, "tokenId", default="")).strip()
-
-
-def get_token_address(item: Dict[str, Any]) -> str:
-    return as_str(safe_get(item, "tokenAddress", default="")).strip()
-
-
-def get_chain(item: Dict[str, Any]) -> str:
-    return as_str(
-        safe_get(item, "chain", "chainType", "network", default="")
-    ).strip()
-
-
-def get_amount(item: Dict[str, Any]) -> str:
-    return as_str(
-        safe_get(item, "amount", "value", "tokenAmount", "quantity", default="")
-    ).strip()
-
-
-def get_usd(item: Dict[str, Any]) -> float:
-    return as_float(
-        safe_get(
-            item,
-            "usd",
-            "valueUsd",
-            "historicalUSD",
-            "amountUsd",
-            "usdValue",
-            default=0,
-        ),
-        0.0,
-    )
-
-
-def get_tx_hash(item: Dict[str, Any]) -> str:
-    return as_str(
-        safe_get(item, "txHash", "hash", "transactionHash", default="")
-    ).strip()
-
-
-def get_timestamp(item: Dict[str, Any]) -> Any:
-    return safe_get(item, "time", "timestamp", "blockTimestamp", default=None)
-
-
-def get_from_text(item: Dict[str, Any]) -> str:
-    parts = [
-        safe_get(item, "fromLabel", default=None),
-        safe_get(item, "fromEntity", default=None),
-        safe_get(item, "fromName", default=None),
-        safe_get(item, "fromAddress", default=None),
-        safe_get(item, "from", default=None),
-    ]
-    return " | ".join([as_str(x).strip() for x in parts if x])
-
-
-def get_to_text(item: Dict[str, Any]) -> str:
-    parts = [
-        safe_get(item, "toLabel", default=None),
-        safe_get(item, "toEntity", default=None),
-        safe_get(item, "toName", default=None),
-        safe_get(item, "toAddress", default=None),
-        safe_get(item, "to", default=None),
-    ]
-    return " | ".join([as_str(x).strip() for x in parts if x])
-
-
-def format_beijing_time(raw_ts: Any) -> str:
-    if raw_ts is None:
-        return "-"
+def env_float(name: str, default: float) -> float:
     try:
-        if isinstance(raw_ts, (int, float)):
-            dt = datetime.fromtimestamp(float(raw_ts), tz=timezone.utc).astimezone(BEIJING_TZ)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        s = str(raw_ts).strip()
-        if s.endswith("Z"):
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(BEIJING_TZ)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(BEIJING_TZ)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+        return float(os.getenv(name, str(default)).strip())
     except Exception:
-        return str(raw_ts)
+        return default
 
 
-def contains_any_keyword(text: str, keywords: List[str]) -> bool:
-    t = (text or "").lower()
-    return any(k in t for k in keywords)
-
-
-def is_exchange_text(text: str) -> bool:
-    return contains_any_keyword(text, EXCHANGE_KEYWORDS)
-
-
-def is_bot_like_text(text: str) -> bool:
-    return contains_any_keyword(text, BOT_LIKE_KEYWORDS)
-
-
-def classify_direction(item: Dict[str, Any]) -> str:
-    from_text = get_from_text(item)
-    to_text = get_to_text(item)
-
-    from_is_exchange = is_exchange_text(from_text)
-    to_is_exchange = is_exchange_text(to_text)
-
-    if from_is_exchange and not to_is_exchange:
-        return "交易所流出"
-
-    if not from_is_exchange and to_is_exchange:
-        return "交易所流入"
-
-    if from_is_exchange and to_is_exchange:
-        return "交易所互转"
-
-    return "无关"
-
-
-def is_suspected_bot_flow(item: Dict[str, Any]) -> bool:
-    from_text = get_from_text(item)
-    to_text = get_to_text(item)
-
-    direction = classify_direction(item)
-    if direction == "交易所流出":
-        non_exchange_side = to_text
-    elif direction == "交易所流入":
-        non_exchange_side = from_text
-    else:
-        return True
-
-    return is_bot_like_text(non_exchange_side)
-
-
-def make_event_id(item: Dict[str, Any]) -> str:
-    raw = json.dumps(
-        {
-            "tx": get_tx_hash(item),
-            "symbol": get_symbol(item),
-            "amount": get_amount(item),
-            "usd": get_usd(item),
-            "time": get_timestamp(item),
-            "from": get_from_text(item),
-            "to": get_to_text(item),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
-
-
-def token_matches(item: Dict[str, Any]) -> bool:
-    symbol = normalize_token_symbol(get_symbol(item))
-    token_id = normalize_token_symbol(get_token_id(item))
-    token_address = (get_token_address(item) or "").lower()
-
-    wanted = set(TOKEN_WHITELIST)
-    return symbol in wanted or token_id in wanted or token_address in wanted
-
-
-def chain_matches(item: Dict[str, Any]) -> bool:
-    if not CHAIN_WHITELIST:
-        return True
-    return get_chain(item).lower() in set(CHAIN_WHITELIST)
-
-
-def should_alert(item: Dict[str, Any]) -> bool:
-    if not token_matches(item):
-        return False
-
-    if not chain_matches(item):
-        return False
-
-    if get_usd(item) < USD_THRESHOLD:
-        return False
-
-    direction = classify_direction(item)
-    if direction not in ("交易所流出", "交易所流入"):
-        return False
-
-    if is_suspected_bot_flow(item):
-        return False
-
-    return True
-
-
-def extract_items(payload: Any) -> List[Dict[str, Any]]:
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-
-    if isinstance(payload, dict):
-        for k in ("items", "results", "transfers", "data", "payload"):
-            v = payload.get(k)
-            if isinstance(v, list):
-                return [x for x in v if isinstance(x, dict)]
-        if any(k in payload for k in ["txHash", "hash", "fromAddress", "toAddress", "symbol", "tokenSymbol"]):
-            return [payload]
-
-    return []
-
-
-def build_session_payload() -> Dict[str, Any]:
-    payload: Dict[str, Any] = {}
-    if CHAIN_WHITELIST:
-        payload["chains"] = CHAIN_WHITELIST
-    if USD_THRESHOLD > 0:
-        payload["usdGte"] = USD_THRESHOLD
-    return payload
-
-
-def create_ws_session() -> str:
-    url = f"{ARKHAM_HTTP_BASE}/ws/sessions"
-
+def env_int(name: str, default: int) -> int:
     try:
-        resp = requests.post(url, headers=arkham_headers(), json=build_session_payload(), timeout=30)
-        if resp.ok:
-            data = resp.json()
-            session_id = (
-                safe_get(data, "sessionId", "session_id", "id", default=None)
-                or safe_get(data.get("data", {}), "sessionId", "session_id", "id", default=None)
-            )
-            if session_id:
-                logging.info("创建 session 成功: %s", session_id)
-                return str(session_id)
-    except Exception as e:
-        logging.warning("带过滤条件创建 session 失败: %s", e)
-
-    resp = requests.post(url, headers=arkham_headers(), json={}, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    session_id = (
-        safe_get(data, "sessionId", "session_id", "id", default=None)
-        or safe_get(data.get("data", {}), "sessionId", "session_id", "id", default=None)
-    )
-    if not session_id:
-        raise RuntimeError(f"未拿到 session id: {data}")
-    logging.info("创建 session 成功(回退): %s", session_id)
-    return str(session_id)
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
 
 
-def delete_ws_session(session_id: str) -> None:
-    try:
-        url = f"{ARKHAM_HTTP_BASE}/ws/sessions/{session_id}"
-        requests.delete(url, headers=arkham_headers(), timeout=15)
-        logging.info("删除 session: %s", session_id)
-    except Exception as e:
-        logging.warning("删除 session 失败: %s", e)
+@dataclass
+class BigTrade:
+    ts: float
+    symbol: str
+    side: str           # "buy" or "sell"
+    price: float
+    qty: float
+    amount: float
 
 
-def build_ws_url(session_id: str) -> str:
-    params = {"session_id": session_id}
-    if CHAIN_WHITELIST:
-        params["chains"] = ",".join(CHAIN_WHITELIST)
-    if USD_THRESHOLD > 0:
-        params["usdGte"] = str(int(USD_THRESHOLD))
-    return f"{ARKHAM_WS_BASE}?{urlencode(params)}"
+class TelegramNotifier:
+    def __init__(self, token: str, chat_id: str, enabled: bool = True):
+        self.token = token
+        self.chat_id = chat_id
+        self.enabled = enabled and bool(token) and bool(chat_id)
+        self.session: aiohttp.ClientSession | None = None
 
+    async def start(self):
+        if self.session is None:
+            timeout = aiohttp.ClientTimeout(total=15)
+            self.session = aiohttp.ClientSession(timeout=timeout)
 
-def telegram_send(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.info(
-            "Telegram 未配置: token=%s chat=%s",
-            bool(TELEGRAM_BOT_TOKEN),
-            bool(TELEGRAM_CHAT_ID),
-        )
-        return
+    async def close(self):
+        if self.session:
+            await self.session.close()
+            self.session = None
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(
-            url,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000]},
-            timeout=15,
-        )
-    except Exception as e:
-        logging.warning("Telegram 发送失败: %s", e)
+    async def send(self, text: str):
+        if not self.enabled:
+            logging.info("Telegram disabled, message=%s", text.replace("\n", " | "))
+            return
 
-
-def send_startup_test_message() -> None:
-    preview = ", ".join(TOKEN_WHITELIST[:12])
-    if len(TOKEN_WHITELIST) > 12:
-        preview += " ..."
-
-    text = (
-        "✅ Arkham 资金方向版已启动\n"
-        f"启动时间(北京): {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"监控币种数量: {len(TOKEN_WHITELIST)}\n"
-        f"币种预览: {preview}\n"
-        f"单笔最低金额: ${USD_THRESHOLD:,.0f}\n"
-        f"链过滤: {', '.join(CHAIN_WHITELIST) if CHAIN_WHITELIST else '全部'}\n"
-        "说明: 已尽量过滤套利机器人、做市商、路由器、桥、DEX、MEV 等标签"
-    )
-    telegram_send(text)
-    logging.info("已尝试发送启动测试消息到 Telegram")
-
-
-def analyze_signal(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    direction = classify_direction(item)
-    usd = get_usd(item)
-    reasons: List[str] = []
-
-    if direction == "交易所流出":
-        bias = "偏多 / 可考虑买多"
-        signal_type = "🟢 主力吸筹倾向"
-        reasons.append("大额从交易所流出，偏向提币囤币")
-    elif direction == "交易所流入":
-        bias = "偏空 / 可考虑买空"
-        signal_type = "🔴 主力出货倾向"
-        reasons.append("大额流入交易所，存在卖压风险")
-    else:
-        return None
-
-    reasons.append(f"单笔金额 ≥ ${USD_THRESHOLD:,.0f}")
-    reasons.append("命中重点监控币种列表")
-    reasons.append("已尽量排除套利机器人、做市商、路由器、桥、DEX、MEV 等标签")
-
-    if CHAIN_WHITELIST:
-        reasons.append("命中链白名单")
-
-    return {
-        "signal_type": signal_type,
-        "bias": bias,
-        "direction": direction,
-        "usd": usd,
-        "reasons": reasons,
-    }
-
-
-def build_message(item: Dict[str, Any], signal: Dict[str, Any]) -> str:
-    symbol = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-").upper()
-    chain = get_chain(item) or "-"
-    amount = get_amount(item) or "-"
-    usd_value = signal["usd"]
-    ts_bj = format_beijing_time(get_timestamp(item))
-    from_text = get_from_text(item) or "-"
-    to_text = get_to_text(item) or "-"
-    tx = get_tx_hash(item) or "-"
-    reasons_text = "\n".join([f"- {x}" for x in signal["reasons"]])
-
-    return (
-        f"{signal['signal_type']} 信号\n"
-        f"时间(北京): {ts_bj}\n"
-        f"建议: {signal['bias']}\n"
-        f"币种: {symbol}\n"
-        f"链: {chain}\n"
-        f"单笔金额(USD): ${usd_value:,.2f}\n"
-        f"数量: {amount}\n"
-        f"From: {from_text}\n"
-        f"To: {to_text}\n"
-        f"Tx: {tx}\n\n"
-        f"判定原因:\n{reasons_text}"
-    )
-
-
-async def run_forever() -> None:
-    if not API_KEY:
-        raise ValueError("缺少 ARKHAM_API_KEY")
-
-    seen: List[str] = []
-    seen_set = set()
-    backoff = RECONNECT_MIN
-
-    while True:
-        session_id: Optional[str] = None
         try:
-            session_id = create_ws_session()
-            ws_url = build_ws_url(session_id)
+            if self.session is None:
+                await self.start()
 
-            logging.info("连接 WebSocket: %s", ws_url)
+            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            payload = {
+                "chat_id": self.chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            }
+            async with self.session.post(url, data=payload) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logging.error("Telegram send failed: %s %s", resp.status, body)
+        except Exception as e:
+            logging.exception("Telegram send exception: %s", e)
 
-            async with websockets.connect(
-                ws_url,
-                extra_headers={
-                    "API-Key": API_KEY,
-                    "User-Agent": "arkham-flow-monitor/9.0",
-                },
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=10,
-                max_size=10 * 1024 * 1024,
-            ) as ws:
-                logging.info("WebSocket 已连接")
-                backoff = RECONNECT_MIN
 
-                async for raw in ws:
-                    try:
-                        payload = json.loads(raw)
-                    except Exception:
-                        logging.warning("收到非 JSON 数据")
+class SignalBot:
+    def __init__(self):
+        self.ws_base = os.getenv(
+            "BINANCE_WS_URL",
+            "wss://fstream.binance.com/stream"
+        )
+
+        whitelist_raw = os.getenv(
+            "TOKEN_WHITELIST",
+            "SIGNUSDT,DOGEUSDT,KITEUSDT,HYPEUSDT,SIRENUSDT,PHAUSDT,POWERUSDT,"
+            "SKYAIUSDT,BARDUSDT,QUSDT,UAIUSDT,HUSDT,ICXUSDT,ROBOUSDT,OGNUSDT,"
+            "XAIUSDT,IPUSDT,XAGUSDT,GUSDT,ANKRUSDT,ANIMEUSDT,BANUSDT,GUNUSDT,"
+            "ZROUSDT,CUSDT,LIGHTUSDT,CVCUSDT,AVAUSDT"
+        )
+
+        self.whitelist = {
+            x.strip().upper()
+            for x in whitelist_raw.split(",")
+            if x.strip()
+        }
+
+        self.stream_symbols = [s.lower() for s in self.whitelist]
+
+        self.big_order_threshold = env_float("BIG_ORDER_THRESHOLD", 50000.0)
+
+        # 机器人过滤参数
+        self.repeat_window_sec = env_int("REPEAT_WINDOW_SEC", 10)
+        self.repeat_tolerance = env_float("REPEAT_TOLERANCE", 0.01)  # 1%
+        self.repeat_min_count = env_int("REPEAT_MIN_COUNT", 4)
+
+        self.hedge_window_sec = env_int("HEDGE_WINDOW_SEC", 5)
+        self.hedge_min_count = env_int("HEDGE_MIN_COUNT", 3)
+        self.hedge_min_total = env_float("HEDGE_MIN_TOTAL", 100000.0)
+        self.hedge_diff_ratio = env_float("HEDGE_DIFF_RATIO", 0.20)
+
+        self.price_move_check_sec = env_int("PRICE_MOVE_CHECK_SEC", 3)
+        self.price_move_threshold = env_float("PRICE_MOVE_THRESHOLD", 0.0005)  # 0.05%
+
+        self.cooldown_sec = env_int("ALERT_COOLDOWN_SEC", 8)
+        self.enable_console = env_bool("ENABLE_CONSOLE_LOG", True)
+
+        self.tele_notifier = TelegramNotifier(
+            token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+            chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+            enabled=env_bool("ENABLE_TELEGRAM", True),
+        )
+
+        # 运行时数据
+        self.recent_big_trades: dict[str, deque[BigTrade]] = defaultdict(deque)
+        self.pending_signals: deque[dict] = deque()
+        self.last_prices: dict[str, float] = {}
+        self.last_alert_ts: dict[str, float] = {}
+
+        self._stop = False
+
+    def log_config(self):
+        logging.info("Arkham/大单过滤版启动")
+        logging.info("北京时间: %s", bj_now_str())
+        logging.info("TOKEN_WHITELIST=%s", ",".join(sorted(self.whitelist)))
+        logging.info("TOKEN_WHITELIST数量=%s", len(self.whitelist))
+        logging.info("BIG_ORDER_THRESHOLD=%s", self.big_order_threshold)
+        logging.info("REPEAT_WINDOW_SEC=%s", self.repeat_window_sec)
+        logging.info("REPEAT_TOLERANCE=%s", self.repeat_tolerance)
+        logging.info("REPEAT_MIN_COUNT=%s", self.repeat_min_count)
+        logging.info("HEDGE_WINDOW_SEC=%s", self.hedge_window_sec)
+        logging.info("HEDGE_MIN_COUNT=%s", self.hedge_min_count)
+        logging.info("HEDGE_MIN_TOTAL=%s", self.hedge_min_total)
+        logging.info("HEDGE_DIFF_RATIO=%s", self.hedge_diff_ratio)
+        logging.info("PRICE_MOVE_CHECK_SEC=%s", self.price_move_check_sec)
+        logging.info("PRICE_MOVE_THRESHOLD=%s", self.price_move_threshold)
+        logging.info("ALERT_COOLDOWN_SEC=%s", self.cooldown_sec)
+        logging.info("ENABLE_TELEGRAM=%s", self.tele_notifier.enabled)
+
+    def build_ws_url(self) -> str:
+        streams = "/".join(f"{symbol}@aggTrade" for symbol in self.stream_symbols)
+        return f"{self.ws_base}?streams={streams}"
+
+    def cleanup_old_trades(self, symbol: str, now_ts: float):
+        q = self.recent_big_trades[symbol]
+        max_keep = max(self.repeat_window_sec, self.hedge_window_sec) + 2
+        while q and now_ts - q[0].ts > max_keep:
+            q.popleft()
+
+    def is_repeating_bot_pattern(self, symbol: str, current_amount: float) -> bool:
+        """
+        10秒内，如果相近金额的大单重复 >= repeat_min_count，视为程序刷单/拆单。
+        """
+        q = self.recent_big_trades[symbol]
+        similar = 0
+
+        for t in q:
+            if current_amount <= 0:
+                continue
+            diff = abs(t.amount - current_amount) / current_amount
+            if diff <= self.repeat_tolerance:
+                similar += 1
+
+        return similar >= self.repeat_min_count
+
+    def is_hedge_pattern(self, symbol: str, now_ts: float) -> bool:
+        """
+        短时间内大买和大卖都很多，且差值很小，像对冲/做市/套利。
+        """
+        q = self.recent_big_trades[symbol]
+        buy_total = 0.0
+        sell_total = 0.0
+        count = 0
+
+        for t in q:
+            if now_ts - t.ts <= self.hedge_window_sec:
+                count += 1
+                if t.side == "buy":
+                    buy_total += t.amount
+                else:
+                    sell_total += t.amount
+
+        if count < self.hedge_min_count:
+            return False
+
+        if buy_total >= self.hedge_min_total and sell_total >= self.hedge_min_total:
+            total = buy_total + sell_total
+            if total <= 0:
+                return False
+            diff_ratio = abs(buy_total - sell_total) / total
+            if diff_ratio < self.hedge_diff_ratio:
+                return True
+
+        return False
+
+    def format_alert(self, symbol: str, side: str, amount: float, trade_price: float, current_price: float, move_ratio: float) -> str:
+        side_cn = "🟢买单推动" if side == "buy" else "🔴卖单推动"
+        move_pct = move_ratio * 100
+
+        return (
+            f"⚡ 大单报警\n"
+            f"时间: {bj_now_str()}\n"
+            f"币种: {symbol}\n"
+            f"方向: {side_cn}\n"
+            f"成交额: {amount:,.0f} USDT\n"
+            f"成交价: {trade_price:.8f}\n"
+            f"当前价: {current_price:.8f}\n"
+            f"推动幅度: {move_pct:.4f}%\n"
+            f"阈值: ≥ {self.big_order_threshold:,.0f} USDT"
+        )
+
+    async def send_alert_if_not_cooldown(self, symbol: str, text: str):
+        now_ts = time.time()
+        last_ts = self.last_alert_ts.get(symbol, 0.0)
+        if now_ts - last_ts < self.cooldown_sec:
+            logging.info("%s 冷却中，跳过报警", symbol)
+            return
+
+        self.last_alert_ts[symbol] = now_ts
+        if self.enable_console:
+            print("\n" + "=" * 70)
+            print(text)
+            print("=" * 70 + "\n")
+        await self.tele_notifier.send(text)
+
+    async def process_pending_signals_loop(self):
+        """
+        候选信号二次确认：
+        大单后等待几秒，如果价格确实被推动，再报警。
+        """
+        while not self._stop:
+            try:
+                now_ts = time.time()
+                remain = deque()
+
+                while self.pending_signals:
+                    s = self.pending_signals.popleft()
+                    symbol = s["symbol"]
+
+                    if now_ts - s["ts"] < self.price_move_check_sec:
+                        remain.append(s)
                         continue
 
-                    items = extract_items(payload)
-                    if not items:
+                    entry_price = s["price"]
+                    current_price = self.last_prices.get(symbol, entry_price)
+                    side = s["side"]
+                    amount = s["amount"]
+
+                    if entry_price <= 0:
                         continue
 
-                    for item in items:
-                        symbol_dbg = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-")
-                        usd_dbg = get_usd(item)
-                        direction_dbg = classify_direction(item)
+                    if side == "buy":
+                        move_ratio = (current_price - entry_price) / entry_price
+                        if move_ratio >= self.price_move_threshold:
+                            text = self.format_alert(
+                                symbol=symbol,
+                                side=side,
+                                amount=amount,
+                                trade_price=entry_price,
+                                current_price=current_price,
+                                move_ratio=move_ratio,
+                            )
+                            await self.send_alert_if_not_cooldown(symbol, text)
+                        else:
+                            logging.info(
+                                "%s 买单未推动价格，忽略。entry=%s current=%s move=%.6f",
+                                symbol, entry_price, current_price, move_ratio
+                            )
+                    else:
+                        move_ratio = (entry_price - current_price) / entry_price
+                        if move_ratio >= self.price_move_threshold:
+                            text = self.format_alert(
+                                symbol=symbol,
+                                side=side,
+                                amount=amount,
+                                trade_price=entry_price,
+                                current_price=current_price,
+                                move_ratio=move_ratio,
+                            )
+                            await self.send_alert_if_not_cooldown(symbol, text)
+                        else:
+                            logging.info(
+                                "%s 卖单未推动价格，忽略。entry=%s current=%s move=%.6f",
+                                symbol, entry_price, current_price, move_ratio
+                            )
 
-                        logging.info(
-                            "候选事件: symbol=%s usd=%s direction=%s",
-                            symbol_dbg, usd_dbg, direction_dbg
-                        )
+                self.pending_signals = remain
+                await asyncio.sleep(1)
+            except Exception as e:
+                logging.exception("process_pending_signals_loop error: %s", e)
+                await asyncio.sleep(1)
 
-                        if not should_alert(item):
-                            continue
+    async def handle_trade_message(self, raw: str):
+        """
+        Binance futures combined stream:
+        {
+          "stream":"dogeusdt@aggTrade",
+          "data":{
+             "e":"aggTrade",
+             "E":123456789,
+             "s":"DOGEUSDT",
+             "a":5933014,
+             "p":"0.10450",
+             "q":"500000",
+             "f":100,
+             "l":105,
+             "T":123456785,
+             "m":false
+          }
+        }
+        """
+        try:
+            msg = json.loads(raw)
+            data = msg.get("data", {})
+            if not data:
+                return
 
-                        eid = make_event_id(item)
-                        if eid in seen_set:
-                            continue
+            symbol = str(data.get("s", "")).upper()
+            if symbol not in self.whitelist:
+                return
 
-                        signal = analyze_signal(item)
-                        if not signal:
-                            continue
+            price = safe_float(data.get("p"))
+            qty = safe_float(data.get("q"))
+            amount = price * qty
 
-                        seen.append(eid)
-                        seen_set.add(eid)
+            if price <= 0 or qty <= 0:
+                return
 
-                        if len(seen) > MAX_SEEN_SIZE:
-                            old = seen.pop(0)
-                            seen_set.discard(old)
+            self.last_prices[symbol] = price
 
-                        msg = build_message(item, signal)
-                        logging.info("\n%s", msg)
-                        telegram_send(msg)
+            if amount < self.big_order_threshold:
+                return
+
+            now_ts = time.time()
+            is_buyer_maker = bool(data.get("m", False))
+            side = "sell" if is_buyer_maker else "buy"
+
+            trade = BigTrade(
+                ts=now_ts,
+                symbol=symbol,
+                side=side,
+                price=price,
+                qty=qty,
+                amount=amount,
+            )
+
+            q = self.recent_big_trades[symbol]
+            q.append(trade)
+            self.cleanup_old_trades(symbol, now_ts)
+
+            logging.info(
+                "%s 候选大单 | %s | side=%s | amount=%.2f | price=%s | qty=%s",
+                bj_now_str(), symbol, side, amount, price, qty
+            )
+
+            # 过滤1：重复金额刷单
+            if self.is_repeating_bot_pattern(symbol, amount):
+                logging.info(
+                    "%s 疑似重复金额程序单，过滤。amount=%.2f",
+                    symbol, amount
+                )
+                return
+
+            # 过滤2：对冲/套利/做市
+            if self.is_hedge_pattern(symbol, now_ts):
+                logging.info("%s 疑似对冲/套利/做市，过滤。", symbol)
+                return
+
+            # 进入待确认队列
+            self.pending_signals.append({
+                "ts": now_ts,
+                "symbol": symbol,
+                "side": side,
+                "price": price,
+                "amount": amount,
+            })
 
         except Exception as e:
-            logging.exception("主循环异常: %s", e)
-            if session_id:
-                delete_ws_session(session_id)
+            logging.exception("handle_trade_message error: %s", e)
 
-            logging.info("准备重连，%s秒后继续", backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, RECONNECT_MAX)
+    async def consume_ws(self):
+        ws_url = self.build_ws_url()
+        logging.info("WebSocket URL: %s", ws_url)
+
+        backoff = 3
+        max_backoff = 30
+
+        while not self._stop:
+            try:
+                async with websockets.connect(
+                    ws_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=10,
+                    max_size=10 * 1024 * 1024,
+                ) as ws:
+                    logging.info("WebSocket connected")
+                    backoff = 3
+
+                    async for message in ws:
+                        await self.handle_trade_message(message)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logging.exception("WebSocket error: %s", e)
+                logging.info("将在 %s 秒后重连...", backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+
+    async def run(self):
+        self.log_config()
+        await self.tele_notifier.start()
+
+        tasks = [
+            asyncio.create_task(self.consume_ws(), name="consume_ws"),
+            asyncio.create_task(self.process_pending_signals_loop(), name="pending_loop"),
+        ]
+
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            self._stop = True
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await self.tele_notifier.close()
 
 
-def main():
-    setup_logger()
+def setup_logging():
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
 
-    logging.info("Arkham 资金方向版启动")
-    logging.info("TOKEN_WHITELIST数量=%s", len(TOKEN_WHITELIST))
-    logging.info("TOKEN_WHITELIST=%s", ",".join(TOKEN_WHITELIST))
-    logging.info("CHAIN_WHITELIST=%s", CHAIN_WHITELIST if CHAIN_WHITELIST else "全部")
-    logging.info("USD_THRESHOLD=%s", USD_THRESHOLD)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
 
-    logging.info("ENV TELEGRAM_BOT_TOKEN = %s", os.getenv("TELEGRAM_BOT_TOKEN"))
-    logging.info("ENV TELEGRAM_CHAT_ID = %s", os.getenv("TELEGRAM_CHAT_ID"))
 
-    send_startup_test_message()
-    asyncio.run(run_forever())
+async def main():
+    setup_logging()
+    logging.info("机器人启动")
+    bot = SignalBot()
+    await bot.run()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("已手动停止")
