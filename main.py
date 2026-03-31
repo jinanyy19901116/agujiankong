@@ -16,11 +16,69 @@ ARKHAM_WS_BASE = "wss://api.arkm.com/ws/transfers"
 
 API_KEY = os.getenv("ARKHAM_API_KEY", "").strip()
 
-TOKEN_WHITELIST = [
-    x.strip().lower()
-    for x in os.getenv("TOKEN_WHITELIST", "").split(",")
-    if x.strip()
+# 你的重点监控币种，已去掉 KRW-
+DEFAULT_TOKEN_WHITELIST = [
+    "sent",
+    "sol",
+    "cfg",
+    "doge",
+    "dood",
+    "ankr",
+    "bard",
+    "tao",
+    "elsa",
+    "ada",
+    "ip",
+    "kite",
+    "ong",
+    "vana",
+    "kat",
+    "wld",
+    "sui",
+    "la",
+    "steem",
+    "virtual",
+    "gas",
+    "moodeng",
+    "xlm",
+    "sahara",
+    "chz",
+    "trump",
+    "anime",
+    "shib",
+    "sei",
+    "sign",
+    "sonic",
+    "trx",
+    "skr",
+    "bch",
+    "pengu",
+    "kernel",
+    "order",
+    "enso",
+    "ath",
+    "knc",
+    "zbt",
+    "link",
+    "akt",
+    "cpool",
 ]
+
+
+def normalize_token_symbol(token: str) -> str:
+    token = (token or "").strip().lower()
+    if token.startswith("krw-"):
+        token = token[4:]
+    return token
+
+
+ENV_TOKEN_WHITELIST = [
+    normalize_token_symbol(x)
+    for x in os.getenv("TOKEN_WHITELIST", "").split(",")
+    if normalize_token_symbol(x)
+]
+
+TOKEN_WHITELIST = ENV_TOKEN_WHITELIST if ENV_TOKEN_WHITELIST else DEFAULT_TOKEN_WHITELIST
 
 CHAIN_WHITELIST = [
     x.strip().lower()
@@ -28,8 +86,7 @@ CHAIN_WHITELIST = [
     if x.strip()
 ]
 
-USD_THRESHOLD = float(os.getenv("USD_THRESHOLD", "100000"))
-MIN_ALERT_SCORE = int(os.getenv("MIN_ALERT_SCORE", "60"))
+USD_THRESHOLD = float(os.getenv("USD_THRESHOLD", "150000"))
 SIGNAL_WINDOW_SECONDS = int(os.getenv("SIGNAL_WINDOW_SECONDS", "300"))
 
 UPBIT_KEYWORDS = [
@@ -72,7 +129,7 @@ def arkham_headers() -> Dict[str, str]:
         "API-Key": API_KEY,
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "upbit-arkham-monitor/2.1",
+        "User-Agent": "upbit-arkham-monitor/3.0",
     }
 
 
@@ -246,12 +303,9 @@ def make_event_id(item: Dict[str, Any]) -> str:
 
 
 def token_matches(item: Dict[str, Any]) -> bool:
-    if not TOKEN_WHITELIST:
-        return True
-
-    symbol = get_symbol(item).lower()
-    token_id = get_token_id(item).lower()
-    token_address = get_token_address(item).lower()
+    symbol = normalize_token_symbol(get_symbol(item))
+    token_id = normalize_token_symbol(get_token_id(item))
+    token_address = (get_token_address(item) or "").lower()
 
     wanted = set(TOKEN_WHITELIST)
     return symbol in wanted or token_id in wanted or token_address in wanted
@@ -375,12 +429,35 @@ def telegram_send(text: str) -> None:
         logging.warning("Telegram 发送失败: %s", e)
 
 
+def send_startup_test_message() -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.info("未配置 Telegram，跳过启动测试消息")
+        return
+
+    token_preview = ", ".join(TOKEN_WHITELIST[:12])
+    if len(TOKEN_WHITELIST) > 12:
+        token_preview += " ..."
+
+    text = (
+        "✅ Upbit Arkham 监控机器人已启动\n"
+        f"启动时间(北京): {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"监控币种数量: {len(TOKEN_WHITELIST)}\n"
+        f"监控币种预览: {token_preview}\n"
+        f"金额阈值(USD): ${USD_THRESHOLD:,.0f}\n"
+        f"链过滤: {', '.join(CHAIN_WHITELIST) if CHAIN_WHITELIST else '全部'}\n"
+        f"Upbit关键词: {', '.join(UPBIT_KEYWORDS)}\n"
+        "状态: 启动测试成功，开始监听 WebSocket 实时数据"
+    )
+    telegram_send(text)
+    logging.info("已发送启动测试消息到 Telegram")
+
+
 def cleanup_recent_signals() -> None:
     now = time.time()
     recent_signals[:] = [x for x in recent_signals if now - x["ts"] <= SIGNAL_WINDOW_SECONDS]
 
 
-def add_recent_signal(symbol: str, direction: str, usd_value: float, score: int) -> None:
+def add_recent_signal(symbol: str, direction: str, usd_value: float) -> None:
     cleanup_recent_signals()
     recent_signals.append(
         {
@@ -388,7 +465,6 @@ def add_recent_signal(symbol: str, direction: str, usd_value: float, score: int)
             "symbol": symbol.lower(),
             "direction": direction,
             "usd": usd_value,
-            "score": score,
         }
     )
 
@@ -402,81 +478,63 @@ def count_same_direction_signals(symbol: str, direction: str) -> int:
     )
 
 
-def score_signal(item: Dict[str, Any]) -> Dict[str, Any]:
+def analyze_signal(item: Dict[str, Any]) -> Dict[str, Any]:
     direction = classify_direction(item)
     usd_value = get_usd(item)
-    symbol = get_symbol(item) or get_token_id(item) or "-"
+    symbol = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-")
     reasons: List[str] = []
-    score = 0
+    strength_points = 0
 
     if direction == "流入Upbit":
-        score += 35
         reasons.append("大额转入Upbit，存在卖压风险")
+        bias = "偏空 / 可考虑买空"
+        strength_points += 2
     elif direction == "流出Upbit":
-        score += 35
         reasons.append("大额转出Upbit，偏向提币囤币")
+        bias = "偏多 / 可考虑买多"
+        strength_points += 2
     elif direction == "Upbit内部/关联地址调拨":
-        score += 5
         reasons.append("检测到Upbit内部或关联地址调拨")
+        bias = "中性 / 观望"
+        strength_points -= 2
     else:
         reasons.append("非Upbit核心信号")
+        bias = "观望"
 
     if usd_value >= USD_THRESHOLD:
-        score += 20
         reasons.append(f"金额达到阈值 ${USD_THRESHOLD:,.0f}")
+        strength_points += 1
     if usd_value >= max(USD_THRESHOLD * 2, USD_THRESHOLD + 1):
-        score += 15
         reasons.append("金额显著高于基础阈值")
+        strength_points += 1
     if usd_value >= max(USD_THRESHOLD * 5, USD_THRESHOLD + 1):
-        score += 10
         reasons.append("金额极大")
+        strength_points += 1
 
-    if TOKEN_WHITELIST:
-        score += 10
-        reasons.append("命中自定义币种白名单")
-    else:
-        reasons.append("当前未设置币种白名单")
+    reasons.append("命中重点监控币种列表")
 
     if CHAIN_WHITELIST:
-        score += 5
         reasons.append("命中链白名单")
 
     if is_exchange_to_exchange(item):
-        score -= 25
         reasons.append("疑似交易所之间搬砖/调拨，信号降权")
-
-    if direction == "Upbit内部/关联地址调拨":
-        score -= 40
-        reasons.append("内部调拨显著降权")
+        strength_points -= 1
 
     same_count = count_same_direction_signals(symbol, direction)
     if same_count >= 1:
-        bonus = min(20, same_count * 8)
-        score += bonus
         reasons.append(f"短时间同币种同方向连续异动 {same_count + 1} 笔")
+        strength_points += min(2, same_count)
 
-    score = max(0, min(100, score))
-
-    if direction == "流入Upbit":
-        bias = "偏空 / 可考虑做空"
-    elif direction == "流出Upbit":
-        bias = "偏多 / 可考虑做多"
-    elif direction == "Upbit内部/关联地址调拨":
-        bias = "中性 / 观望"
-    else:
-        bias = "观望"
-
-    if score >= 85:
+    if strength_points >= 5:
         strength = "🔥🔥🔥 强信号"
-    elif score >= 70:
+    elif strength_points >= 3:
         strength = "🔥🔥 中强信号"
-    elif score >= 60:
+    elif strength_points >= 1:
         strength = "🔥 中等信号"
     else:
         strength = "⚪ 弱信号"
 
     return {
-        "score": score,
         "direction": direction,
         "bias": bias,
         "strength": strength,
@@ -485,7 +543,7 @@ def score_signal(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_message(item: Dict[str, Any], signal: Dict[str, Any]) -> str:
-    symbol = get_symbol(item) or get_token_id(item) or "-"
+    symbol = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-")
     chain = get_chain(item) or "-"
     amount = get_amount(item) or "-"
     usd_value = get_usd(item)
@@ -507,13 +565,12 @@ def build_message(item: Dict[str, Any], signal: Dict[str, Any]) -> str:
     reasons_text = "\n".join([f"- {x}" for x in signal["reasons"]])
 
     return (
-        f"{emoji} Upbit 小币种大额转账告警 V2\n"
+        f"{emoji} Upbit 重点币种大额转账告警\n"
         f"时间(北京): {ts_bj}\n"
         f"方向: {direction}\n"
         f"建议: {signal['bias']}\n"
         f"强度: {signal['strength']}\n"
-        f"评分: {signal['score']}/100\n"
-        f"币种: {symbol}\n"
+        f"币种: {symbol.upper()}\n"
         f"链: {chain}\n"
         f"金额(USD): ${usd_value:,.2f}\n"
         f"数量: {amount}\n"
@@ -544,7 +601,7 @@ async def run_forever() -> None:
                 ws_url,
                 extra_headers={
                     "API-Key": API_KEY,
-                    "User-Agent": "upbit-arkham-monitor/2.1",
+                    "User-Agent": "upbit-arkham-monitor/3.0",
                 },
                 ping_interval=20,
                 ping_timeout=20,
@@ -573,12 +630,10 @@ async def run_forever() -> None:
                         if eid in seen_set:
                             continue
 
-                        signal = score_signal(item)
-                        if signal["score"] < MIN_ALERT_SCORE:
-                            continue
+                        signal = analyze_signal(item)
 
-                        symbol = get_symbol(item) or get_token_id(item) or "-"
-                        add_recent_signal(symbol, signal["direction"], get_usd(item), signal["score"])
+                        symbol = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-")
+                        add_recent_signal(symbol, signal["direction"], get_usd(item))
 
                         seen.append(eid)
                         seen_set.add(eid)
@@ -604,13 +659,15 @@ async def run_forever() -> None:
 def main():
     setup_logger()
 
-    logging.info("Upbit Arkham 监控 V2 启动")
-    logging.info("TOKEN_WHITELIST=%s", TOKEN_WHITELIST if TOKEN_WHITELIST else "全部")
+    logging.info("Upbit Arkham 监控启动")
+    logging.info("TOKEN_WHITELIST数量=%s", len(TOKEN_WHITELIST))
+    logging.info("TOKEN_WHITELIST=%s", ",".join(TOKEN_WHITELIST))
     logging.info("CHAIN_WHITELIST=%s", CHAIN_WHITELIST if CHAIN_WHITELIST else "全部")
     logging.info("USD_THRESHOLD=%s", USD_THRESHOLD)
-    logging.info("MIN_ALERT_SCORE=%s", MIN_ALERT_SCORE)
     logging.info("UPBIT_KEYWORDS=%s", UPBIT_KEYWORDS)
     logging.info("EXCHANGE_KEYWORDS=%s", EXCHANGE_KEYWORDS)
+
+    send_startup_test_message()
 
     asyncio.run(run_forever())
 
