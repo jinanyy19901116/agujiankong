@@ -31,7 +31,7 @@ CHAIN_WHITELIST = [
     if x.strip()
 ]
 
-USD_THRESHOLD = float(os.getenv("USD_THRESHOLD", "150000"))
+USD_THRESHOLD = float(os.getenv("USD_THRESHOLD", "50000"))
 
 EXCHANGE_KEYWORDS = [
     "upbit", "up-bit",
@@ -69,7 +69,7 @@ def arkham_headers() -> Dict[str, str]:
         "API-Key": API_KEY,
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "exchange-flow-monitor/5.0",
+        "User-Agent": "exchange-flow-monitor/6.0",
     }
 
 
@@ -427,7 +427,7 @@ def build_message(item: Dict[str, Any], signal: Dict[str, Any]) -> str:
     reasons_text = "\n".join([f"- {x}" for x in signal["reasons"]])
 
     return (
-        f"{emoji} 币种大额资金异动提示\n"
+        f"{emoji} 币种大额买多买空提示\n"
         f"时间(北京): {ts_bj}\n"
         f"方向: {direction}\n"
         f"建议: {signal['bias']}\n"
@@ -462,7 +462,7 @@ async def run_forever() -> None:
                 ws_url,
                 extra_headers={
                     "API-Key": API_KEY,
-                    "User-Agent": "exchange-flow-monitor/5.0",
+                    "User-Agent": "exchange-flow-monitor/6.0",
                 },
                 ping_interval=20,
                 ping_timeout=20,
@@ -484,6 +484,15 @@ async def run_forever() -> None:
                         continue
 
                     for item in items:
+                        symbol_dbg = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-")
+                        usd_dbg = get_usd(item)
+                        direction_dbg = classify_direction(item)
+
+                        logging.info(
+                            "候选事件: symbol=%s usd=%s direction=%s",
+                            symbol_dbg, usd_dbg, direction_dbg
+                        )
+
                         if not should_alert(item):
                             continue
 
@@ -526,7 +535,6 @@ def main():
     logging.info("USD_THRESHOLD=%s", USD_THRESHOLD)
     logging.info("EXCHANGE_KEYWORDS=%s", EXCHANGE_KEYWORDS)
 
-    # Telegram 环境变量调试
     logging.info("ENV TELEGRAM_BOT_TOKEN = %s", os.getenv("TELEGRAM_BOT_TOKEN"))
     logging.info("ENV TELEGRAM_CHAT_ID = %s", os.getenv("TELEGRAM_CHAT_ID"))
 
