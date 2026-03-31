@@ -16,661 +16,166 @@ ARKHAM_WS_BASE = "wss://api.arkm.com/ws/transfers"
 
 API_KEY = os.getenv("ARKHAM_API_KEY", "").strip()
 
-# 你的重点监控币种，已去掉 KRW-
-DEFAULT_TOKEN_WHITELIST = [
-    "sent",
-    "sol",
-    "cfg",
-    "doge",
-    "dood",
-    "ankr",
-    "bard",
-    "tao",
-    "elsa",
-    "ada",
-    "ip",
-    "kite",
-    "ong",
-    "vana",
-    "kat",
-    "wld",
-    "sui",
-    "la",
-    "steem",
-    "virtual",
-    "gas",
-    "moodeng",
-    "xlm",
-    "sahara",
-    "chz",
-    "trump",
-    "anime",
-    "shib",
-    "sei",
-    "sign",
-    "sonic",
-    "trx",
-    "skr",
-    "bch",
-    "pengu",
-    "kernel",
-    "order",
-    "enso",
-    "ath",
-    "knc",
-    "zbt",
-    "link",
-    "akt",
-    "cpool",
-]
-
-
-def normalize_token_symbol(token: str) -> str:
-    token = (token or "").strip().lower()
-    if token.startswith("krw-"):
-        token = token[4:]
-    return token
-
-
-ENV_TOKEN_WHITELIST = [
-    normalize_token_symbol(x)
-    for x in os.getenv("TOKEN_WHITELIST", "").split(",")
-    if normalize_token_symbol(x)
-]
-
-TOKEN_WHITELIST = ENV_TOKEN_WHITELIST if ENV_TOKEN_WHITELIST else DEFAULT_TOKEN_WHITELIST
-
-CHAIN_WHITELIST = [
-    x.strip().lower()
-    for x in os.getenv("CHAIN_WHITELIST", "").split(",")
-    if x.strip()
+# 固定币种（已去 KRW-）
+TOKEN_WHITELIST = [
+    "sent","sol","cfg","doge","dood","ankr","bard","tao","elsa","ada",
+    "ip","kite","ong","vana","kat","wld","sui","la","steem","virtual",
+    "gas","moodeng","xlm","sahara","chz","trump","anime","shib",
+    "sei","sign","sonic","trx","skr","bch","pengu","kernel","order",
+    "enso","ath","knc","zbt","link","akt","cpool"
 ]
 
 USD_THRESHOLD = float(os.getenv("USD_THRESHOLD", "150000"))
-SIGNAL_WINDOW_SECONDS = int(os.getenv("SIGNAL_WINDOW_SECONDS", "300"))
 
-UPBIT_KEYWORDS = [
-    x.strip().lower()
-    for x in os.getenv("UPBIT_KEYWORDS", "upbit,up-bit").split(",")
-    if x.strip()
-]
-
-EXCHANGE_KEYWORDS = [
-    x.strip().lower()
-    for x in os.getenv(
-        "EXCHANGE_KEYWORDS",
-        "upbit,binance,coinbase,kraken,okx,bybit,bitget,gate,kucoin,htx,mexc,bithumb,bitfinex,crypto.com",
-    ).split(",")
-    if x.strip()
-]
+UPBIT_KEYWORDS = ["upbit", "up-bit"]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-RECONNECT_MIN = 3
-RECONNECT_MAX = 60
+recent_signals = []
 
-MAX_SEEN_SIZE = 5000
+def setup_logger():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-recent_signals: List[Dict[str, Any]] = []
-
-
-def setup_logger() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-    )
-
-
-def arkham_headers() -> Dict[str, str]:
-    return {
-        "API-Key": API_KEY,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "upbit-arkham-monitor/3.0",
-    }
-
-
-def safe_get(d: Any, *keys: str, default=None):
-    if not isinstance(d, dict):
-        return default
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return default
-
-
-def as_str(v: Any) -> str:
-    if v is None:
-        return ""
-    return str(v)
-
-
-def as_float(v: Any, default: float = 0.0) -> float:
-    try:
-        if v is None or v == "":
-            return default
-        return float(v)
-    except Exception:
-        return default
-
-
-def get_symbol(item: Dict[str, Any]) -> str:
-    return as_str(
-        safe_get(item, "symbol", "tokenSymbol", "token", "tokenId", default="")
-    ).strip()
-
-
-def get_token_id(item: Dict[str, Any]) -> str:
-    return as_str(safe_get(item, "tokenId", default="")).strip()
-
-
-def get_token_address(item: Dict[str, Any]) -> str:
-    return as_str(safe_get(item, "tokenAddress", default="")).strip()
-
-
-def get_chain(item: Dict[str, Any]) -> str:
-    return as_str(
-        safe_get(item, "chain", "chainType", "network", default="")
-    ).strip()
-
-
-def get_amount(item: Dict[str, Any]) -> str:
-    return as_str(
-        safe_get(item, "amount", "value", "tokenAmount", "quantity", default="")
-    ).strip()
-
-
-def get_usd(item: Dict[str, Any]) -> float:
-    return as_float(
-        safe_get(
-            item,
-            "usd",
-            "valueUsd",
-            "historicalUSD",
-            "amountUsd",
-            "usdValue",
-            default=0,
-        ),
-        0.0,
-    )
-
-
-def get_tx_hash(item: Dict[str, Any]) -> str:
-    return as_str(
-        safe_get(item, "txHash", "hash", "transactionHash", default="")
-    ).strip()
-
-
-def get_timestamp(item: Dict[str, Any]) -> Any:
-    return safe_get(item, "time", "timestamp", "blockTimestamp", default=None)
-
-
-def get_from_text(item: Dict[str, Any]) -> str:
-    parts = [
-        safe_get(item, "fromLabel", default=None),
-        safe_get(item, "fromEntity", default=None),
-        safe_get(item, "fromName", default=None),
-        safe_get(item, "fromAddress", default=None),
-        safe_get(item, "from", default=None),
-    ]
-    return " | ".join([as_str(x).strip() for x in parts if x])
-
-
-def get_to_text(item: Dict[str, Any]) -> str:
-    parts = [
-        safe_get(item, "toLabel", default=None),
-        safe_get(item, "toEntity", default=None),
-        safe_get(item, "toName", default=None),
-        safe_get(item, "toAddress", default=None),
-        safe_get(item, "to", default=None),
-    ]
-    return " | ".join([as_str(x).strip() for x in parts if x])
-
-
-def contains_any_keyword(text: str, keywords: List[str]) -> bool:
-    t = text.lower()
-    return any(k in t for k in keywords)
-
-
-def contains_upbit(text: str) -> bool:
-    return contains_any_keyword(text, UPBIT_KEYWORDS)
-
-
-def contains_exchange(text: str) -> bool:
-    return contains_any_keyword(text, EXCHANGE_KEYWORDS)
-
-
-def classify_direction(item: Dict[str, Any]) -> str:
-    from_text = get_from_text(item)
-    to_text = get_to_text(item)
-
-    from_is_upbit = contains_upbit(from_text)
-    to_is_upbit = contains_upbit(to_text)
-
-    if from_is_upbit and not to_is_upbit:
-        return "流出Upbit"
-    if not from_is_upbit and to_is_upbit:
-        return "流入Upbit"
-    if from_is_upbit and to_is_upbit:
-        return "Upbit内部/关联地址调拨"
-    return "非Upbit"
-
-
-def is_exchange_to_exchange(item: Dict[str, Any]) -> bool:
-    from_text = get_from_text(item)
-    to_text = get_to_text(item)
-    return contains_exchange(from_text) and contains_exchange(to_text)
-
-
-def format_beijing_time(raw_ts: Any) -> str:
-    if raw_ts is None:
-        return "-"
-    try:
-        if isinstance(raw_ts, (int, float)):
-            dt = datetime.fromtimestamp(float(raw_ts), tz=timezone.utc).astimezone(BEIJING_TZ)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        s = str(raw_ts).strip()
-        if s.endswith("Z"):
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(BEIJING_TZ)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(BEIJING_TZ)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return str(raw_ts)
-
-
-def make_event_id(item: Dict[str, Any]) -> str:
-    raw = json.dumps(
-        {
-            "tx": get_tx_hash(item),
-            "symbol": get_symbol(item),
-            "amount": get_amount(item),
-            "usd": get_usd(item),
-            "time": get_timestamp(item),
-            "from": get_from_text(item),
-            "to": get_to_text(item),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
-
-
-def token_matches(item: Dict[str, Any]) -> bool:
-    symbol = normalize_token_symbol(get_symbol(item))
-    token_id = normalize_token_symbol(get_token_id(item))
-    token_address = (get_token_address(item) or "").lower()
-
-    wanted = set(TOKEN_WHITELIST)
-    return symbol in wanted or token_id in wanted or token_address in wanted
-
-
-def chain_matches(item: Dict[str, Any]) -> bool:
-    if not CHAIN_WHITELIST:
-        return True
-    return get_chain(item).lower() in set(CHAIN_WHITELIST)
-
-
-def is_upbit_related(item: Dict[str, Any]) -> bool:
-    from_text = get_from_text(item)
-    to_text = get_to_text(item)
-    return contains_upbit(from_text) or contains_upbit(to_text)
-
-
-def should_alert(item: Dict[str, Any]) -> bool:
-    if not is_upbit_related(item):
-        return False
-    if not token_matches(item):
-        return False
-    if not chain_matches(item):
-        return False
-    if get_usd(item) < USD_THRESHOLD:
-        return False
-    return True
-
-
-def extract_items(payload: Any) -> List[Dict[str, Any]]:
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-
-    if isinstance(payload, dict):
-        for k in ("items", "results", "transfers", "data", "payload"):
-            v = payload.get(k)
-            if isinstance(v, list):
-                return [x for x in v if isinstance(x, dict)]
-        if any(k in payload for k in ["txHash", "hash", "fromAddress", "toAddress", "symbol", "tokenSymbol"]):
-            return [payload]
-
-    return []
-
-
-def build_session_payload() -> Dict[str, Any]:
-    payload: Dict[str, Any] = {}
-    if TOKEN_WHITELIST:
-        payload["tokens"] = TOKEN_WHITELIST
-    if CHAIN_WHITELIST:
-        payload["chains"] = CHAIN_WHITELIST
-    if USD_THRESHOLD > 0:
-        payload["usdGte"] = USD_THRESHOLD
-    return payload
-
-
-def create_ws_session() -> str:
-    url = f"{ARKHAM_HTTP_BASE}/ws/sessions"
-
-    try:
-        resp = requests.post(url, headers=arkham_headers(), json=build_session_payload(), timeout=30)
-        if resp.ok:
-            data = resp.json()
-            session_id = (
-                safe_get(data, "sessionId", "session_id", "id", default=None)
-                or safe_get(data.get("data", {}), "sessionId", "session_id", "id", default=None)
-            )
-            if session_id:
-                logging.info("创建 session 成功: %s", session_id)
-                return str(session_id)
-    except Exception as e:
-        logging.warning("带过滤条件创建 session 失败: %s", e)
-
-    resp = requests.post(url, headers=arkham_headers(), json={}, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    session_id = (
-        safe_get(data, "sessionId", "session_id", "id", default=None)
-        or safe_get(data.get("data", {}), "sessionId", "session_id", "id", default=None)
-    )
-    if not session_id:
-        raise RuntimeError(f"未拿到 session id: {data}")
-    logging.info("创建 session 成功(回退): %s", session_id)
-    return str(session_id)
-
-
-def delete_ws_session(session_id: str) -> None:
-    try:
-        url = f"{ARKHAM_HTTP_BASE}/ws/sessions/{session_id}"
-        requests.delete(url, headers=arkham_headers(), timeout=15)
-        logging.info("删除 session: %s", session_id)
-    except Exception as e:
-        logging.warning("删除 session 失败: %s", e)
-
-
-def build_ws_url(session_id: str) -> str:
-    params = {"session_id": session_id}
-    if TOKEN_WHITELIST:
-        params["tokens"] = ",".join(TOKEN_WHITELIST)
-    if CHAIN_WHITELIST:
-        params["chains"] = ",".join(CHAIN_WHITELIST)
-    if USD_THRESHOLD > 0:
-        params["usdGte"] = str(int(USD_THRESHOLD))
-    return f"{ARKHAM_WS_BASE}?{urlencode(params)}"
-
-
-def telegram_send(text: str) -> None:
+def telegram_send(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.info("Telegram 未配置: token=%s chat=%s", bool(TELEGRAM_BOT_TOKEN), bool(TELEGRAM_CHAT_ID))
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(
-            url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text[:4000],
-            },
-            timeout=15,
-        )
-    except Exception as e:
-        logging.warning("Telegram 发送失败: %s", e)
+    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000]})
 
+def send_startup_test():
+    telegram_send(f"✅ 机器人启动成功\n监控币种数量: {len(TOKEN_WHITELIST)}")
 
-def send_startup_test_message() -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.info("未配置 Telegram，跳过启动测试消息")
-        return
+def contains_upbit(text):
+    return any(k in text.lower() for k in UPBIT_KEYWORDS)
 
-    token_preview = ", ".join(TOKEN_WHITELIST[:12])
-    if len(TOKEN_WHITELIST) > 12:
-        token_preview += " ..."
+def get(d, *keys):
+    for k in keys:
+        if k in d and d[k]:
+            return d[k]
+    return ""
 
-    text = (
-        "✅ Upbit Arkham 监控机器人已启动\n"
-        f"启动时间(北京): {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"监控币种数量: {len(TOKEN_WHITELIST)}\n"
-        f"监控币种预览: {token_preview}\n"
-        f"金额阈值(USD): ${USD_THRESHOLD:,.0f}\n"
-        f"链过滤: {', '.join(CHAIN_WHITELIST) if CHAIN_WHITELIST else '全部'}\n"
-        f"Upbit关键词: {', '.join(UPBIT_KEYWORDS)}\n"
-        "状态: 启动测试成功，开始监听 WebSocket 实时数据"
-    )
-    telegram_send(text)
-    logging.info("已发送启动测试消息到 Telegram")
+def classify(item):
+    f = get(item, "fromLabel","fromEntity","fromAddress","from")
+    t = get(item, "toLabel","toEntity","toAddress","to")
 
+    if contains_upbit(f) and not contains_upbit(t):
+        return "流出Upbit"
+    if contains_upbit(t) and not contains_upbit(f):
+        return "流入Upbit"
+    if contains_upbit(f) and contains_upbit(t):
+        return "内部"
+    return "无关"
 
-def cleanup_recent_signals() -> None:
-    now = time.time()
-    recent_signals[:] = [x for x in recent_signals if now - x["ts"] <= SIGNAL_WINDOW_SECONDS]
+def analyze(item):
+    direction = classify(item)
+    usd = float(get(item,"usd","valueUsd","historicalUSD") or 0)
+    symbol = get(item,"symbol","tokenSymbol","tokenId").lower()
 
+    if symbol not in TOKEN_WHITELIST:
+        return None
 
-def add_recent_signal(symbol: str, direction: str, usd_value: float) -> None:
-    cleanup_recent_signals()
-    recent_signals.append(
-        {
-            "ts": time.time(),
-            "symbol": symbol.lower(),
-            "direction": direction,
-            "usd": usd_value,
-        }
-    )
+    if usd < USD_THRESHOLD:
+        return None
 
-
-def count_same_direction_signals(symbol: str, direction: str) -> int:
-    cleanup_recent_signals()
-    symbol = symbol.lower()
-    return sum(
-        1 for x in recent_signals
-        if x["symbol"] == symbol and x["direction"] == direction
-    )
-
-
-def analyze_signal(item: Dict[str, Any]) -> Dict[str, Any]:
-    direction = classify_direction(item)
-    usd_value = get_usd(item)
-    symbol = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-")
-    reasons: List[str] = []
-    strength_points = 0
+    strength = 0
+    reasons = []
 
     if direction == "流入Upbit":
-        reasons.append("大额转入Upbit，存在卖压风险")
-        bias = "偏空 / 可考虑买空"
-        strength_points += 2
+        strength += 2
+        bias = "做空"
+        reasons.append("转入交易所")
     elif direction == "流出Upbit":
-        reasons.append("大额转出Upbit，偏向提币囤币")
-        bias = "偏多 / 可考虑买多"
-        strength_points += 2
-    elif direction == "Upbit内部/关联地址调拨":
-        reasons.append("检测到Upbit内部或关联地址调拨")
-        bias = "中性 / 观望"
-        strength_points -= 2
+        strength += 2
+        bias = "做多"
+        reasons.append("转出交易所")
     else:
-        reasons.append("非Upbit核心信号")
-        bias = "观望"
+        return None
 
-    if usd_value >= USD_THRESHOLD:
-        reasons.append(f"金额达到阈值 ${USD_THRESHOLD:,.0f}")
-        strength_points += 1
-    if usd_value >= max(USD_THRESHOLD * 2, USD_THRESHOLD + 1):
-        reasons.append("金额显著高于基础阈值")
-        strength_points += 1
-    if usd_value >= max(USD_THRESHOLD * 5, USD_THRESHOLD + 1):
-        reasons.append("金额极大")
-        strength_points += 1
+    if usd > USD_THRESHOLD * 2:
+        strength += 1
+        reasons.append("金额较大")
 
-    reasons.append("命中重点监控币种列表")
+    same = sum(1 for x in recent_signals if x == direction)
+    if same >= 1:
+        strength += 1
+        reasons.append("连续信号")
 
-    if CHAIN_WHITELIST:
-        reasons.append("命中链白名单")
-
-    if is_exchange_to_exchange(item):
-        reasons.append("疑似交易所之间搬砖/调拨，信号降权")
-        strength_points -= 1
-
-    same_count = count_same_direction_signals(symbol, direction)
-    if same_count >= 1:
-        reasons.append(f"短时间同币种同方向连续异动 {same_count + 1} 笔")
-        strength_points += min(2, same_count)
-
-    if strength_points >= 5:
-        strength = "🔥🔥🔥 强信号"
-    elif strength_points >= 3:
-        strength = "🔥🔥 中强信号"
-    elif strength_points >= 1:
-        strength = "🔥 中等信号"
+    if strength >= 4:
+        level = "🔥🔥🔥 强信号"
+    elif strength >= 2:
+        level = "🔥🔥 中信号"
     else:
-        strength = "⚪ 弱信号"
+        return None   # ❗过滤弱信号
 
-    return {
-        "direction": direction,
-        "bias": bias,
-        "strength": strength,
-        "reasons": reasons,
-    }
+    recent_signals.append(direction)
 
+    return level, bias, reasons
 
-def build_message(item: Dict[str, Any], signal: Dict[str, Any]) -> str:
-    symbol = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-")
-    chain = get_chain(item) or "-"
-    amount = get_amount(item) or "-"
-    usd_value = get_usd(item)
-    ts_bj = format_beijing_time(get_timestamp(item))
-    from_text = get_from_text(item) or "-"
-    to_text = get_to_text(item) or "-"
-    tx = get_tx_hash(item) or "-"
+def build_msg(item, signal):
+    level, bias, reasons = signal
+    usd = float(get(item,"usd","valueUsd","historicalUSD") or 0)
+    symbol = get(item,"symbol","tokenSymbol","tokenId").upper()
 
-    direction = signal["direction"]
-    if direction == "流入Upbit":
-        emoji = "🔴"
-    elif direction == "流出Upbit":
-        emoji = "🟢"
-    elif direction == "Upbit内部/关联地址调拨":
-        emoji = "🟡"
-    else:
-        emoji = "⚪"
+    return f"""
+{level}
+币种: {symbol}
+方向: {bias}
+金额: ${usd:,.0f}
 
-    reasons_text = "\n".join([f"- {x}" for x in signal["reasons"]])
+原因:
+- {' '.join(reasons)}
+"""
 
-    return (
-        f"{emoji} Upbit 重点币种大额转账告警\n"
-        f"时间(北京): {ts_bj}\n"
-        f"方向: {direction}\n"
-        f"建议: {signal['bias']}\n"
-        f"强度: {signal['strength']}\n"
-        f"币种: {symbol.upper()}\n"
-        f"链: {chain}\n"
-        f"金额(USD): ${usd_value:,.2f}\n"
-        f"数量: {amount}\n"
-        f"From: {from_text}\n"
-        f"To: {to_text}\n"
-        f"Tx: {tx}\n\n"
-        f"判定原因:\n{reasons_text}"
-    )
-
-
-async def run_forever() -> None:
+async def run():
     if not API_KEY:
-        raise ValueError("缺少 ARKHAM_API_KEY")
+        raise ValueError("缺少ARKHAM_API_KEY")
 
-    seen: List[str] = []
-    seen_set = set()
-    backoff = RECONNECT_MIN
+    session = requests.post(f"{ARKHAM_HTTP_BASE}/ws/sessions", headers={"API-Key":API_KEY}).json()
+    sid = session.get("sessionId") or session.get("id")
 
-    while True:
-        session_id: Optional[str] = None
-        try:
-            session_id = create_ws_session()
-            ws_url = build_ws_url(session_id)
+    url = f"{ARKHAM_WS_BASE}?session_id={sid}&usdGte={int(USD_THRESHOLD)}"
 
-            logging.info("连接 WebSocket: %s", ws_url)
+    async with websockets.connect(
+        url,
+        extra_headers={"API-Key": API_KEY}
+    ) as ws:
 
-            async with websockets.connect(
-                ws_url,
-                extra_headers={
-                    "API-Key": API_KEY,
-                    "User-Agent": "upbit-arkham-monitor/3.0",
-                },
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=10,
-                max_size=10 * 1024 * 1024,
-            ) as ws:
-                logging.info("WebSocket 已连接")
-                backoff = RECONNECT_MIN
+        logging.info("WebSocket 已连接")
 
-                async for raw in ws:
-                    try:
-                        payload = json.loads(raw)
-                    except Exception:
-                        logging.warning("收到非 JSON 数据")
-                        continue
+        async for raw in ws:
+            try:
+                data = json.loads(raw)
+            except:
+                continue
 
-                    items = extract_items(payload)
-                    if not items:
-                        continue
+            items = data if isinstance(data,list) else [data]
 
-                    for item in items:
-                        if not should_alert(item):
-                            continue
+            for item in items:
+                signal = analyze(item)
+                if not signal:
+                    continue
 
-                        eid = make_event_id(item)
-                        if eid in seen_set:
-                            continue
-
-                        signal = analyze_signal(item)
-
-                        symbol = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-")
-                        add_recent_signal(symbol, signal["direction"], get_usd(item))
-
-                        seen.append(eid)
-                        seen_set.add(eid)
-
-                        if len(seen) > MAX_SEEN_SIZE:
-                            old = seen.pop(0)
-                            seen_set.discard(old)
-
-                        msg = build_message(item, signal)
-                        logging.info("\n%s", msg)
-                        telegram_send(msg)
-
-        except Exception as e:
-            logging.exception("主循环异常: %s", e)
-            if session_id:
-                delete_ws_session(session_id)
-
-            logging.info("准备重连，%s秒后继续", backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, RECONNECT_MAX)
-
+                msg = build_msg(item, signal)
+                logging.info(msg)
+                telegram_send(msg)
 
 def main():
     setup_logger()
 
-    logging.info("Upbit Arkham 监控启动")
-    logging.info("TOKEN_WHITELIST数量=%s", len(TOKEN_WHITELIST))
-    logging.info("TOKEN_WHITELIST=%s", ",".join(TOKEN_WHITELIST))
-    logging.info("CHAIN_WHITELIST=%s", CHAIN_WHITELIST if CHAIN_WHITELIST else "全部")
-    logging.info("USD_THRESHOLD=%s", USD_THRESHOLD)
-    logging.info("UPBIT_KEYWORDS=%s", UPBIT_KEYWORDS)
-    logging.info("EXCHANGE_KEYWORDS=%s", EXCHANGE_KEYWORDS)
+    logging.info("Upbit监控启动")
 
-    send_startup_test_message()
+    # 🔥 调试环境变量
+    logging.info("ENV TELEGRAM_BOT_TOKEN = %s", os.getenv("TELEGRAM_BOT_TOKEN"))
+    logging.info("ENV TELEGRAM_CHAT_ID = %s", os.getenv("TELEGRAM_CHAT_ID"))
 
-    asyncio.run(run_forever())
+    send_startup_test()
 
+    asyncio.run(run())
 
 if __name__ == "__main__":
     main()
