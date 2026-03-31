@@ -32,7 +32,6 @@ CHAIN_WHITELIST = [
 ]
 
 USD_THRESHOLD = float(os.getenv("USD_THRESHOLD", "150000"))
-SIGNAL_WINDOW_SECONDS = int(os.getenv("SIGNAL_WINDOW_SECONDS", "300"))
 
 EXCHANGE_KEYWORDS = [
     "upbit", "up-bit",
@@ -49,8 +48,6 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 RECONNECT_MIN = 3
 RECONNECT_MAX = 60
 MAX_SEEN_SIZE = 5000
-
-recent_signals: List[Dict[str, Any]] = []
 
 
 def setup_logger() -> None:
@@ -72,7 +69,7 @@ def arkham_headers() -> Dict[str, str]:
         "API-Key": API_KEY,
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "exchange-flow-monitor/4.0",
+        "User-Agent": "exchange-flow-monitor/5.0",
     }
 
 
@@ -283,8 +280,6 @@ def extract_items(payload: Any) -> List[Dict[str, Any]]:
 
 def build_session_payload() -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
-    if TOKEN_WHITELIST:
-        payload["tokens"] = TOKEN_WHITELIST
     if CHAIN_WHITELIST:
         payload["chains"] = CHAIN_WHITELIST
     if USD_THRESHOLD > 0:
@@ -333,8 +328,6 @@ def delete_ws_session(session_id: str) -> None:
 
 def build_ws_url(session_id: str) -> str:
     params = {"session_id": session_id}
-    if TOKEN_WHITELIST:
-        params["tokens"] = ",".join(TOKEN_WHITELIST)
     if CHAIN_WHITELIST:
         params["chains"] = ",".join(CHAIN_WHITELIST)
     if USD_THRESHOLD > 0:
@@ -384,82 +377,31 @@ def send_startup_test_message() -> None:
     logging.info("已尝试发送启动测试消息到 Telegram")
 
 
-def cleanup_recent_signals() -> None:
-    now = time.time()
-    recent_signals[:] = [x for x in recent_signals if now - x["ts"] <= SIGNAL_WINDOW_SECONDS]
-
-
-def add_recent_signal(symbol: str, direction: str, usd_value: float) -> None:
-    cleanup_recent_signals()
-    recent_signals.append(
-        {
-            "ts": time.time(),
-            "symbol": symbol.lower(),
-            "direction": direction,
-            "usd": usd_value,
-        }
-    )
-
-
-def count_same_direction_signals(symbol: str, direction: str) -> int:
-    cleanup_recent_signals()
-    symbol = symbol.lower()
-    return sum(
-        1 for x in recent_signals
-        if x["symbol"] == symbol and x["direction"] == direction
-    )
-
-
 def analyze_signal(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     direction = classify_direction(item)
     usd_value = get_usd(item)
-    symbol = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-")
     reasons: List[str] = []
-    strength_points = 0
 
     if direction == "交易所流出":
         reasons.append("大额从交易所流出，偏向提币囤币")
         bias = "偏多 / 可考虑买多"
-        strength_points += 2
     elif direction == "交易所流入":
         reasons.append("大额流入交易所，存在卖压风险")
         bias = "偏空 / 可考虑买空"
-        strength_points += 2
     else:
         return None
 
     if usd_value >= USD_THRESHOLD:
         reasons.append(f"金额达到阈值 ${USD_THRESHOLD:,.0f}")
-        strength_points += 1
-    if usd_value >= max(USD_THRESHOLD * 2, USD_THRESHOLD + 1):
-        reasons.append("金额显著高于基础阈值")
-        strength_points += 1
-    if usd_value >= max(USD_THRESHOLD * 5, USD_THRESHOLD + 1):
-        reasons.append("金额极大")
-        strength_points += 1
 
     reasons.append("命中重点监控币种列表")
 
     if CHAIN_WHITELIST:
         reasons.append("命中链白名单")
 
-    same_count = count_same_direction_signals(symbol, direction)
-    if same_count >= 1:
-        reasons.append(f"短时间同币种同方向连续异动 {same_count + 1} 笔")
-        strength_points += min(2, same_count)
-
-    # 只保留中、强信号
-    if strength_points >= 5:
-        strength = "🔥🔥🔥 强信号"
-    elif strength_points >= 3:
-        strength = "🔥🔥 中信号"
-    else:
-        return None
-
     return {
         "direction": direction,
         "bias": bias,
-        "strength": strength,
         "reasons": reasons,
     }
 
@@ -485,11 +427,10 @@ def build_message(item: Dict[str, Any], signal: Dict[str, Any]) -> str:
     reasons_text = "\n".join([f"- {x}" for x in signal["reasons"]])
 
     return (
-        f"{emoji} 交易所大额资金异动告警\n"
+        f"{emoji} 币种大额资金异动提示\n"
         f"时间(北京): {ts_bj}\n"
         f"方向: {direction}\n"
         f"建议: {signal['bias']}\n"
-        f"强度: {signal['strength']}\n"
         f"币种: {symbol.upper()}\n"
         f"链: {chain}\n"
         f"金额(USD): ${usd_value:,.2f}\n"
@@ -521,7 +462,7 @@ async def run_forever() -> None:
                 ws_url,
                 extra_headers={
                     "API-Key": API_KEY,
-                    "User-Agent": "exchange-flow-monitor/4.0",
+                    "User-Agent": "exchange-flow-monitor/5.0",
                 },
                 ping_interval=20,
                 ping_timeout=20,
@@ -554,9 +495,6 @@ async def run_forever() -> None:
                         if not signal:
                             continue
 
-                        symbol = normalize_token_symbol(get_symbol(item) or get_token_id(item) or "-")
-                        add_recent_signal(symbol, signal["direction"], get_usd(item))
-
                         seen.append(eid)
                         seen_set.add(eid)
 
@@ -581,7 +519,7 @@ async def run_forever() -> None:
 def main():
     setup_logger()
 
-    logging.info("交易所资金流监控启动")
+    logging.info("币种大额买多买空提示监控启动")
     logging.info("TOKEN_WHITELIST数量=%s", len(TOKEN_WHITELIST))
     logging.info("TOKEN_WHITELIST=%s", ",".join(TOKEN_WHITELIST))
     logging.info("CHAIN_WHITELIST=%s", CHAIN_WHITELIST if CHAIN_WHITELIST else "全部")
