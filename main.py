@@ -1,9 +1,8 @@
-import os
+import asyncio
 import json
 import time
-import asyncio
+import os
 import logging
-from dataclasses import dataclass
 from collections import defaultdict, deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -12,169 +11,111 @@ import aiohttp
 import websockets
 from dotenv import load_dotenv
 
-# 环境加载
+# 环境与日志配置
 load_dotenv()
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ================= 策略参数建议值 (2026 高胜率版) =================
-# 建议在 Railway 或 .env 中根据个人风险偏好调整
-GLOBAL_BIG_ORDER = float(os.getenv("BIG_ORDER_THRESHOLD", "80000"))  # 基础门槛 8万 USDT
-NET_RATIO_REQ = float(os.getenv("NET_RATIO_THRESHOLD", "2.5"))       # 净流入必须是流出的 2.5 倍
-PRICE_CHECK_DELAY = 8                                                # 延迟 8 秒确认，过滤假突破
-# ===============================================================
+# ================= 法比奥策略参数 (超短线级别) =================
+FABIO_BIG_ORDER = 120000      # 法比奥看重确定性，门槛调高到 12万 USDT
+FABIO_SQUEEZE_S = 45          # 统计过去 45 秒的波动收缩
+FABIO_MAX_VOLATILITY = 0.0018 # 45秒内波动必须在 0.18% 以内（极度收缩）
+FABIO_CONFIRM_S = 3           # 法比奥讲究快，3秒内必须脱离成本区
+# ==========================================================
 
-@dataclass
-class TradeRecord:
-    ts: float
-    side: str
-    amount: float
-    price: float
-
-class WhaleProBot:
+class FabioStrategyBot:
     def __init__(self):
-        # 币种白名单整合：主流 + 热门Meme + SIGN协议类
-        whitelist_raw = os.getenv("TOKEN_WHITELIST", 
-            "BTCUSDT,ETHUSDT,SOLUSDT,SIGNUSDT,ENSUSDT,LINKUSDT,DOGEUSDT,PEPEUSDT,WIFUSDT,PNUTUSDT,GOATUSDT,ACTUSDT,NEIROUSDT")
-        self.whitelist = {x.strip().upper() for x in whitelist_raw.split(",") if x.strip()}
-        
-        self.tele_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-        
-        # 数据存储
-        self.history = defaultdict(lambda: deque(maxlen=300))
-        self.last_prices = {}
-        self._stop = False
+        self.symbols = []
+        self.history = defaultdict(lambda: deque(maxlen=200))
+        self.prices = defaultdict(lambda: deque(maxlen=120))
+        self.last_alert = {}
         self.session = None
+        self.tele_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
     async def init_session(self):
-        if not self.session:
-            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        if not self.session: self.session = aiohttp.ClientSession()
 
-    def get_bj_time(self):
-        return datetime.now(BEIJING_TZ).strftime("%H:%M:%S")
+    async def get_all_symbols(self):
+        """ 自动获取币安所有 USDT 永续合约 """
+        url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+        async with self.session.get(url) as r:
+            data = await r.json()
+            return [s['symbol'] for s in data['symbols'] if s['status'] == 'TRADING' and s['symbol'].endswith('USDT')]
 
-    def get_market_sentiment(self, symbol):
-        """核心策略：计算 60 秒内的资金合力净值"""
-        now = time.time()
-        q = self.history[symbol]
-        while q and now - q[0].ts > 60:
-            q.popleft()
-            
-        buys = sum(t.amount for t in q if t.side == "buy")
-        sells = sum(t.amount for t in q if t.side == "sell")
+    def is_fabio_squeeze(self, symbol):
+        """ 法比奥收缩逻辑：寻找弹簧被压到极致的瞬间 """
+        p_list = list(self.prices[symbol])[-FABIO_SQUEEZE_S:]
+        if len(p_list) < FABIO_SQUEEZE_S: return False
         
-        if buys == 0 and sells == 0: return None, 0, 0, 0
-        
-        net_flow = buys - sells
-        # 计算倍数关系
-        ratio = (buys / sells) if sells > 0 else 999 if buys > 0 else 0
-        if sells > buys:
-            ratio = (sells / buys) if buys > 0 else 999
-            
-        return ("BUY" if net_flow > 0 else "SELL"), abs(net_flow), ratio, (buys + sells)
+        high, low = max(p_list), min(p_list)
+        current_vol = (high - low) / low
+        return current_vol <= FABIO_MAX_VOLATILITY
 
-    def calculate_tp_sl(self, price, side):
-        """基于胜率逻辑的自动止盈止损建议"""
-        if side == "BUY":
-            tp = price * 1.015  # 1.5% 止盈
-            sl = price * 0.994  # 0.6% 止损
-        else:
-            tp = price * 0.985
-            sl = price * 1.006
-        return tp, sl
-
-    async def verify_signal(self, symbol, entry_price, detected_side):
-        """
-        顺势确认逻辑：
-        大单发生 8 秒后，价格必须维持在突破方向 0.15% - 0.3% 以上
-        """
-        await asyncio.sleep(PRICE_CHECK_DELAY)
-        
-        curr_price = self.last_prices.get(symbol, entry_price)
-        side, net_val, ratio, total_vol = self.get_market_sentiment(symbol)
-        
-        if not side or side != detected_side or ratio < NET_RATIO_REQ:
-            return # 合力不足或方向逆转，放弃信号
-
-        # 价格波动率确认
-        move = (curr_price - entry_price) / entry_price
-        is_valid = False
-        
-        # 针对不同币种执行不同门槛
-        move_req = 0.0015 # 默认 0.15%
-        if any(m in symbol for m in ["PEPE", "DOGE", "PNUT", "GOAT"]): move_req = 0.003 # Meme币要求 0.3%
-        if "SIGN" in symbol: move_req = 0.001 # SIGN类相对稳健，0.1% 即可
-
-        if side == "BUY" and move >= move_req: is_valid = True
-        if side == "SELL" and move <= -move_req: is_valid = True
-
-        if is_valid:
-            tp, sl = self.calculate_tp_sl(curr_price, side)
-            emoji = "🚀" if side == "BUY" else "⛈"
-            msg = (
-                f"{emoji} <b>【胜率策略-资金突破】</b>\n\n"
-                f"<b>币种:</b> #{symbol}\n"
-                f"<b>合力方向:</b> {'多头持续流入' if side == 'BUY' else '空头疯狂砸盘'}\n"
-                f"<b>60s净流入:</b> {net_val/10000:.1f}万 USDT\n"
-                f"<b>多空合力比:</b> {ratio:.1f} 倍\n"
-                f"<b>确认涨跌:</b> {move*100:+.2f}%\n"
-                f"------------------------\n"
-                f"<b>🎯 建议入场价:</b> {curr_price:.6f}\n"
-                f"<b>💰 建议止盈:</b> {tp:.6f}\n"
-                f"<b>🛡 建议止损:</b> {sl:.6f}\n"
-                f"------------------------\n"
-                f"时间: {self.get_bj_time()} (北京)"
-            )
-            await self.send_tg(msg)
-
-    async def send_tg(self, text):
-        if not self.tele_token: 
-            print(f"[{self.get_bj_time()}] {text}")
-            return
+    async def send_tg(self, msg):
+        if not self.tele_token: logging.info(msg); return
         url = f"https://api.telegram.org/bot{self.tele_token}/sendMessage"
         try:
-            async with self.session.post(url, json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}) as r:
-                pass
+            await self.session.post(url, json={"chat_id": self.chat_id, "text": msg, "parse_mode": "HTML"})
         except: pass
 
-    async def handle_msg(self, msg):
-        try:
-            raw = json.loads(msg)
-            data = raw.get("data", {})
-            symbol = data.get("s")
-            if not symbol or symbol not in self.whitelist: return
-            
-            p = float(data.get("p", 0))
-            q = float(data.get("q", 0))
-            amt = p * q
-            self.last_prices[symbol] = p
-            
-            # 基础统计门槛：2万以上计入合力，防止散户噪音
-            if amt >= 20000:
-                side = "sell" if data.get("m") else "buy"
-                self.history[symbol].append(TradeRecord(ts=time.time(), side=side, amount=amt, price=p))
-                
-                # 触发深度验证门槛
-                if amt >= GLOBAL_BIG_ORDER:
-                    asyncio.create_task(self.verify_signal(symbol, p, side.upper()))
-        except: pass
-
-    async def run(self):
-        await self.init_session()
-        streams = "/".join([f"{s.lower()}@aggTrade" for s in self.whitelist])
-        print(f"[{self.get_bj_time()}] 高胜率版启动! 监控币种数: {len(self.whitelist)}")
+    async def monitor_breakout(self, symbol, entry_p):
+        """ 法比奥式的瞬间确认逻辑 """
+        # 1. 检查是否处于“法比奥收缩”状态
+        if not self.is_fabio_squeeze(symbol): return
         
-        while not self._stop:
-            try:
-                async with websockets.connect(f"wss://fstream.binance.com/stream?streams={streams}") as ws:
-                    async for m in ws:
-                        await self.handle_msg(m)
-            except:
-                await asyncio.sleep(5)
+        # 2. 冷却：同一个币 10 分钟只报一次（法比奥只做首冲）
+        if time.time() - self.last_alert.get(symbol, 0) < 600: return
+
+        # 3. 法比奥确认逻辑：3秒内必须保持强势
+        await asyncio.sleep(FABIO_CONFIRM_S)
+        curr_p = list(self.prices[symbol])[-1] if self.prices[symbol] else entry_p
+        
+        # 确认：价格维持在突破点 0.05% 以上，且没有大幅回撤
+        if curr_p >= entry_p * 1.0005:
+            self.last_alert[symbol] = time.time()
+            # 法比奥止损：极窄止损，设在收缩区间的底部
+            p_list = list(self.prices[symbol])[-FABIO_SQUEEZE_S:]
+            sl_price = min(p_list) 
+            tp_price = curr_p * 1.012 # 目标 1.2% 左右的快速波动空间
+
+            text = (
+                f"🎯 <b>【法比奥·引爆点监控】</b>\n"
+                f"<b>标的:</b> #{symbol}\n"
+                f"<b>性质:</b> 极窄波动收缩突破\n"
+                f"------------------------\n"
+                f"<b>⚡ 入场位:</b> {curr_p:.6f}\n"
+                f"<b>🛡 止损位:</b> {sl_price:.6f}\n"
+                f"<b>💰 止盈参考:</b> {tp_price:.6f}\n"
+                f"------------------------\n"
+                f"<b>法比奥贴士:</b> 突破不回头。若价格跌破止损位，说明引爆失败，立即离场。"
+            )
+            await self.send_tg(text)
+
+    async def handle_ws(self, chunk):
+        streams = "/".join([f"{s.lower()}@aggTrade" for s in chunk])
+        url = f"wss://fstream.binance.com/stream?streams={streams}"
+        async with websockets.connect(url) as ws:
+            while True:
+                raw = await ws.recv()
+                data = json.loads(raw)['data']
+                symbol, p, q = data['s'], float(data['p']), float(data['q'])
+                side = "sell" if data['m'] else "buy"
+                
+                self.prices[symbol].append(p)
+                # 记录大额买单
+                if side == "buy" and (p * q) >= FABIO_BIG_ORDER:
+                    asyncio.create_task(self.monitor_breakout(symbol, p))
+
+    async def main(self):
+        await self.init_session()
+        all_symbols = await self.get_all_symbols()
+        logging.info(f"法比奥系统启动：监控 {len(all_symbols)} 个合约标的")
+        
+        # 分片订阅
+        chunks = [all_symbols[i:i+100] for i in range(0, len(all_symbols), 100)]
+        await asyncio.gather(*[self.handle_ws(c) for c in chunks])
 
 if __name__ == "__main__":
-    bot = WhaleProBot()
-    try:
-        asyncio.run(bot.run())
-    except KeyboardInterrupt:
-        pass
+    bot = FabioStrategyBot()
+    asyncio.run(bot.main())
